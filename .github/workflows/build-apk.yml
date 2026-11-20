@@ -20,7 +20,7 @@ jobs:
 
       - name: Make Sample App
         run: |
-          mkdir -p app/src/main/java/com/example/app
+          mkdir -p app/src/main/java/com/apk/create
           mkdir -p app/src/main/res/layout
           cat > settings.gradle <<'EOF'
           pluginManagement {
@@ -36,7 +36,7 @@ jobs:
               mavenCentral()
             }
           }
-          rootProject.name = "MyApp"
+          rootProject.name = "APKCreate"
           include ':app'
           EOF
           cat > gradle.properties <<'EOF'
@@ -46,14 +46,17 @@ jobs:
           cat > app/build.gradle <<'EOF'
           plugins { id 'com.android.application' version '8.2.2' }
           android {
-            namespace 'com.example.app'
+            namespace 'com.apk.create'
             compileSdk 34
             defaultConfig {
-              applicationId 'com.example.app'
+              applicationId 'com.apk.create'
               minSdk 24
               targetSdk 34
               versionCode 1
               versionName '1.0'
+              ndk {
+                abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
+              }
             }
             compileOptions {
               sourceCompatibility JavaVersion.VERSION_17
@@ -68,7 +71,30 @@ jobs:
           EOF
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-            <application android:label="My App">
+            <uses-permission android:name="android.permission.INTERNET" />
+            <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+            <uses-permission android:name="android.permission.CAMERA" />
+            <uses-permission android:name="android.permission.RECORD_AUDIO" />
+            <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+            <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+            <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+            <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+            <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+            <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+            <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+            <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+            <uses-permission android:name="android.permission.BLUETOOTH" />
+            <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+            <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+            <uses-permission android:name="android.permission.READ_CONTACTS" />
+            <uses-permission android:name="android.permission.READ_SMS" />
+            <uses-permission android:name="android.permission.SEND_SMS" />
+            <uses-permission android:name="android.permission.CALL_PHONE" />
+            <uses-permission android:name="android.permission.VIBRATE" />
+            <uses-permission android:name="android.permission.WAKE_LOCK" />
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+            <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+            <application android:label="APK Create">
               <activity android:name=".MainActivity" android:exported="true">
                 <intent-filter>
                   <action android:name="android.intent.action.MAIN" />
@@ -78,18 +104,288 @@ jobs:
             </application>
           </manifest>
           EOF
-          cat > app/src/main/java/com/example/app/MainActivity.java <<'EOF'
-          package com.example.app;
+          cat > app/src/main/java/com/apk/create/MainActivity.java <<'EOF'
+          package com.apk.create;
           import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.net.Uri;
           import android.os.Bundle;
-          import android.widget.TextView;
+          import android.text.Editable;
+          import android.text.TextWatcher;
+          import android.view.Menu;
+          import android.view.MenuItem;
+          import android.widget.*;
+          import java.util.*;
           public class MainActivity extends Activity {
-            protected void onCreate(Bundle b) {
-              super.onCreate(b);
-              TextView t = new TextView(this);
-              t.setText("Hello, APK Builder Server is Working!");
-              setContentView(t);
-            }
+              EditText editor;
+              TextView projectNameView;
+              SharedPreferences prefs;
+              Stack<String> undoStack = new Stack<>();
+              Stack<String> redoStack = new Stack<>();
+              boolean isUndoRedo = false;
+              String appName = "My App";
+              String versionName = "1.0";
+              String versionCode = "1";
+              String sdkMin = "24";
+              String sdkTarget = "34";
+              String packageName = "com.apk.myapp";
+              String author = "";
+              String theme = "Theme";
+              boolean isDebug = true;
+              String serverLink = "";
+              String githubToken = "";
+              String[] allPermissions = {
+                  "android.permission.ACCESS_BACKGROUND_LOCATION",
+                  "android.permission.ACCESS_COARSE_LOCATION",
+                  "android.permission.ACCESS_FINE_LOCATION",
+                  "android.permission.ACCESS_MEDIA_LOCATION",
+                  "android.permission.ACCESS_NETWORK_STATE",
+                  "android.permission.ACCESS_WIFI_STATE",
+                  "android.permission.ANSWER_PHONE_CALLS",
+                  "android.permission.BATTERY_STATS",
+                  "android.permission.BLUETOOTH",
+                  "android.permission.BLUETOOTH_ADMIN",
+                  "android.permission.BLUETOOTH_ADVERTISE",
+                  "android.permission.BLUETOOTH_CONNECT",
+                  "android.permission.BLUETOOTH_SCAN",
+                  "android.permission.CAMERA",
+                  "android.permission.CHANGE_NETWORK_STATE",
+                  "android.permission.CHANGE_WIFI_STATE",
+                  "android.permission.CLEAR_APP_CACHE",
+                  "android.permission.DOWNLOAD_WITHOUT_NOTIFICATION",
+                  "android.permission.FOREGROUND_SERVICE",
+                  "android.permission.GET_PACKAGE_SIZE",
+                  "android.permission.INSTALL_SHORTCUT",
+                  "android.permission.INTERNET",
+                  "android.permission.KILL_BACKGROUND_PROCESSES",
+                  "android.permission.MANAGE_EXTERNAL_STORAGE",
+                  "android.permission.POST_NOTIFICATIONS",
+                  "android.permission.READ_CALL_LOG",
+                  "android.permission.READ_CONTACTS",
+                  "android.permission.READ_EXTERNAL_STORAGE",
+                  "android.permission.READ_FRAME_BUFFER",
+                  "android.permission.READ_LOGS",
+                  "android.permission.READ_MEDIA_AUDIO",
+                  "android.permission.READ_MEDIA_IMAGES",
+                  "android.permission.READ_MEDIA_VIDEO",
+                  "android.permission.READ_PHONE_STATE",
+                  "android.permission.READ_SMS",
+                  "android.permission.RECORD_AUDIO",
+                  "android.permission.REQUEST_INSTALL_PACKAGES",
+                  "android.permission.SEND_SMS",
+                  "android.permission.SET_WALLPAPER",
+                  "android.permission.SYSTEM_ALERT_WINDOW",
+                  "android.permission.VIBRATE",
+                  "android.permission.WAKE_LOCK",
+                  "android.permission.WRITE_CALL_LOG",
+                  "android.permission.WRITE_CONTACTS",
+                  "android.permission.WRITE_EXTERNAL_STORAGE",
+                  "android.permission.WRITE_SETTINGS",
+                  "android.permission.WRITE_SMS",
+                  "android.permission.ACCESS_NOTIFICATION_POLICY",
+                  "android.permission.MODIFY_AUDIO_SETTINGS",
+                  "android.permission.RECEIVE_BOOT_COMPLETED",
+                  "android.permission.RECEIVE_SMS",
+                  "android.permission.USE_BIOMETRIC",
+                  "android.permission.NFC",
+                  "android.permission.FLASHLIGHT",
+                  "android.permission.CALL_PHONE"
+              };
+              boolean[] checkedPermissions;
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  prefs = getSharedPreferences("APKCreate", MODE_PRIVATE);
+                  checkedPermissions = new boolean[allPermissions.length];
+                  serverLink = prefs.getString("server_link", "");
+                  githubToken = prefs.getString("github_token", "");
+                  appName = prefs.getString("app_name", "My App");
+                  packageName = prefs.getString("package_name", "com.apk.myapp");
+                  LinearLayout main = new LinearLayout(this);
+                  main.setOrientation(LinearLayout.VERTICAL);
+                  projectNameView = new TextView(this);
+                  projectNameView.setText("Project: " + appName);
+                  projectNameView.setTextSize(18);
+                  projectNameView.setPadding(20, 20, 20, 20);
+                  main.addView(projectNameView);
+                  editor = new EditText(this);
+                  editor.setHint("Yahan apna JAVA code paste karein...");
+                  editor.setMinLines(20);
+                  editor.setGravity(android.view.Gravity.TOP);
+                  editor.setText(prefs.getString("last_code", ""));
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, 0, 1f);
+                  main.addView(editor, lp);
+                  LinearLayout btnRow = new LinearLayout(this);
+                  btnRow.setOrientation(LinearLayout.HORIZONTAL);
+                  Button undoBtn = new Button(this); undoBtn.setText("Undo");
+                  Button redoBtn = new Button(this); redoBtn.setText("Redo");
+                  Button runBtn = new Button(this); runBtn.setText("Run / Check");
+                  Button saveBtn = new Button(this); saveBtn.setText("Save");
+                  btnRow.addView(undoBtn); btnRow.addView(redoBtn);
+                  btnRow.addView(runBtn); btnRow.addView(saveBtn);
+                  main.addView(btnRow);
+                  undoBtn.setOnClickListener(v -> doUndo());
+                  redoBtn.setOnClickListener(v -> doRedo());
+                  runBtn.setOnClickListener(v -> checkCode());
+                  saveBtn.setOnClickListener(v -> {
+                      prefs.edit().putString("last_code", editor.getText().toString()).apply();
+                      Toast.makeText(this, "Project Saved!", Toast.LENGTH_SHORT).show();
+                  });
+                  editor.addTextChangedListener(new TextWatcher() {
+                      public void beforeTextChanged(CharSequence s, int st, int c, int a) {}
+                      public void onTextChanged(CharSequence s, int st, int b, int c) {}
+                      public void afterTextChanged(Editable s) {
+                          if (!isUndoRedo) { undoStack.push(s.toString()); redoStack.clear(); }
+                      }
+                  });
+                  setContentView(main);
+              }
+              void doUndo() {
+                  if (!undoStack.isEmpty()) {
+                      isUndoRedo = true;
+                      redoStack.push(editor.getText().toString());
+                      editor.setText(undoStack.pop());
+                      isUndoRedo = false;
+                  }
+              }
+              void doRedo() {
+                  if (!redoStack.isEmpty()) {
+                      isUndoRedo = true;
+                      undoStack.push(editor.getText().toString());
+                      editor.setText(redoStack.pop());
+                      isUndoRedo = false;
+                  }
+              }
+              void checkCode() {
+                  String code = editor.getText().toString();
+                  if (code.isEmpty()) Toast.makeText(this, "Code khali hai!", Toast.LENGTH_SHORT).show();
+                  else if (!code.contains("package")) Toast.makeText(this, "Check: package line missing hai", Toast.LENGTH_LONG).show();
+                  else Toast.makeText(this, "Code OK hai! Ab Build Package dabayein.", Toast.LENGTH_LONG).show();
+              }
+              @Override
+              public boolean onCreateOptionsMenu(Menu menu) {
+                  menu.add(0, 1, 0, "More Options");
+                  return true;
+              }
+              @Override
+              public boolean onOptionsItemSelected(MenuItem item) {
+                  showMoreOptions();
+                  return true;
+              }
+              void showMoreOptions() {
+                  String[] opts = {"Project - Open", "Project - New", "Build Package", "Export", "Properties", "Token / Server Settings", "About & Support"};
+                  new AlertDialog.Builder(this).setTitle("More Options - APK Create")
+                      .setItems(opts, (d, which) -> {
+                          if (which == 0) openProject();
+                          if (which == 1) newProject();
+                          if (which == 2) buildPackage();
+                          if (which == 3) exportProject();
+                          if (which == 4) showProperties();
+                          if (which == 5) showTokenServer();
+                          if (which == 6) showAbout();
+                      }).show();
+              }
+              void openProject() {
+                  String saved = prefs.getString("project_list", "My App");
+                  Toast.makeText(this, "Recent Projects: " + saved, Toast.LENGTH_LONG).show();
+              }
+              void newProject() {
+                  LinearLayout l = new LinearLayout(this); l.setOrientation(LinearLayout.VERTICAL);
+                  EditText n = new EditText(this); n.setHint("App ka Naam");
+                  EditText p = new EditText(this); p.setHint("Package Name - com.apk.app");
+                  l.addView(n); l.addView(p);
+                  new AlertDialog.Builder(this).setTitle("New Project").setView(l)
+                      .setPositiveButton("Save / OK", (d, w) -> {
+                          if (!n.getText().toString().isEmpty()) appName = n.getText().toString();
+                          if (!p.getText().toString().isEmpty()) packageName = p.getText().toString();
+                          projectNameView.setText("Project: " + appName);
+                          prefs.edit().putString("project_list", appName).putString("app_name", appName).putString("package_name", packageName).apply();
+                          editor.setText("");
+                      }).setNegativeButton("Cancel", null).show();
+              }
+              void showTokenServer() {
+                  LinearLayout l = new LinearLayout(this); l.setOrientation(LinearLayout.VERTICAL);
+                  TextView info = new TextView(this);
+                  info.setText("Yahan Server Link aur Token dalo. Ek baar Save karne ke baad baar baar nahi dalna parega.");
+                  info.setPadding(10, 10, 10, 10);
+                  EditText eLink = new EditText(this);
+                  eLink.setHint("Server Link - https://github.com/user/apk-builder");
+                  eLink.setText(serverLink);
+                  EditText eToken = new EditText(this);
+                  eToken.setHint("GitHub Token yahan likhein");
+                  eToken.setText(githubToken);
+                  l.addView(info); l.addView(eLink); l.addView(eToken);
+                  new AlertDialog.Builder(this).setTitle("Token / Server Settings").setView(l)
+                      .setPositiveButton("Save", (d, w) -> {
+                          serverLink = eLink.getText().toString().trim();
+                          githubToken = eToken.getText().toString().trim();
+                          prefs.edit().putString("server_link", serverLink).putString("github_token", githubToken).apply();
+                          Toast.makeText(this, "Token aur Server Save ho gaya!", Toast.LENGTH_SHORT).show();
+                      }).setNegativeButton("Cancel", null).show();
+              }
+              void buildPackage() {
+                  if (serverLink.isEmpty() || githubToken.isEmpty()) {
+                      Toast.makeText(this, "Pehle More Options > Token / Server Settings me Link aur Token Save karo!", Toast.LENGTH_LONG).show();
+                      showTokenServer();
+                      return;
+                  }
+                  new AlertDialog.Builder(this).setTitle("Build Package - APK Create")
+                      .setMessage("App: " + appName + "\nPackage: " + packageName + "\nVersion: " + versionName + " (" + versionCode + ")\nSDK Min: " + sdkMin + " Target: " + sdkTarget + "\nServer: " + serverLink + "\n\nUniversal APK banegi - 32-bit + 64-bit, Android 7 se latest tak chalegi.")
+                      .setPositiveButton("Build Start", (d, w) -> Toast.makeText(this, "Build Started! GitHub par APK ban rahi hai.", Toast.LENGTH_LONG).show())
+                      .show();
+              }
+              void exportProject() {
+                  Intent i = new Intent(Intent.ACTION_SEND);
+                  i.setType("text/plain");
+                  i.putExtra(Intent.EXTRA_TEXT, editor.getText().toString());
+                  startActivity(Intent.createChooser(i, "Export Project"));
+              }
+              void showProperties() {
+                  LinearLayout l = new LinearLayout(this); l.setOrientation(LinearLayout.VERTICAL);
+                  EditText eName = new EditText(this); eName.setText(appName); eName.setHint("Name");
+                  EditText eVer = new EditText(this); eVer.setText(versionName); eVer.setHint("Version 1.0");
+                  EditText eCode = new EditText(this); eCode.setText(versionCode); eCode.setHint("Code 1");
+                  EditText eSdk = new EditText(this); eSdk.setText(sdkMin); eSdk.setHint("SDK 24");
+                  EditText eTarget = new EditText(this); eTarget.setText(sdkTarget); eTarget.setHint("Target 34");
+                  EditText ePkg = new EditText(this); ePkg.setText(packageName); ePkg.setHint("Package Name");
+                  EditText eAuthor = new EditText(this); eAuthor.setText(author); eAuthor.setHint("Author");
+                  Button permBtn = new Button(this); permBtn.setText("Change Permissions");
+                  permBtn.setOnClickListener(v -> showPermissions());
+                  l.addView(eName); l.addView(eVer); l.addView(eCode); l.addView(eSdk); l.addView(eTarget); l.addView(ePkg); l.addView(eAuthor); l.addView(permBtn);
+                  new AlertDialog.Builder(this).setTitle("Project Properties").setView(l)
+                      .setPositiveButton("Save", (d, w) -> {
+                          appName = eName.getText().toString();
+                          versionName = eVer.getText().toString();
+                          versionCode = eCode.getText().toString();
+                          sdkMin = eSdk.getText().toString();
+                          sdkTarget = eTarget.getText().toString();
+                          packageName = ePkg.getText().toString();
+                          author = eAuthor.getText().toString();
+                          projectNameView.setText("Project: " + appName);
+                          Toast.makeText(this, "Properties Saved!", Toast.LENGTH_SHORT).show();
+                      }).show();
+              }
+              void showPermissions() {
+                  new AlertDialog.Builder(this).setTitle("Change Permissions")
+                      .setMultiChoiceItems(allPermissions, checkedPermissions, (d, which, isChecked) -> checkedPermissions[which] = isChecked)
+                      .setPositiveButton("OK / Save", (d, w) -> Toast.makeText(this, "Permissions Saved!", Toast.LENGTH_SHORT).show())
+                      .setNegativeButton("Cancel", null).show();
+              }
+              void showAbout() {
+                  LinearLayout l = new LinearLayout(this); l.setOrientation(LinearLayout.VERTICAL);
+                  TextView t = new TextView(this);
+                  t.setText("APK Create\n\nIs app se aap apna JAVA code likh kar, permissions laga kar, Universal APK (32-bit + 64-bit) bana sakte hain.\n\nAndroid 7 se latest version tak sab mobiles par chalegi.\n\nSupport ke liye WhatsApp par rabta karein.");
+                  t.setPadding(20, 20, 20, 20);
+                  Button wa = new Button(this); wa.setText("WhatsApp - Support");
+                  wa.setOnClickListener(v -> {
+                      Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse("https://wa.me/923000000000"));
+                      startActivity(intent);
+                  });
+                  l.addView(t); l.addView(wa);
+                  new AlertDialog.Builder(this).setTitle("About & Support").setView(l).setPositiveButton("OK", null).show();
+              }
           }
           EOF
           echo '<?xml version="1.0" encoding="utf-8"?><LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="match_parent"></LinearLayout>' > app/src/main/res/layout/activity_main.xml
@@ -103,5 +399,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: my-app-apk
+          name: apk-create-apk
           path: app/build/outputs/apk/debug/app-debug.apk

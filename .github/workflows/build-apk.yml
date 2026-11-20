@@ -1,4 +1,4 @@
-name: Build & Release MJ Audio Player APK
+ jahbazname: Build & Release MJ Audio Player APK
 
 on:
   workflow_dispatch:

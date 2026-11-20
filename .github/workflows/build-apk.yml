@@ -1,4 +1,4 @@
-name: Build APK
+name: Build MJ Audio Player APK
 
 on:
   workflow_dispatch:
@@ -13,15 +13,16 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Make Sample App
+      - name: Create MJ Audio Player Project
         run: |
-          mkdir -p app/src/main/java/com/apk/create
+          mkdir -p app/src/main/java/com/mjaudio/player
           mkdir -p app/src/main/res/layout
+
           cat > settings.gradle <<'EOF'
           pluginManagement {
             repositories {
@@ -36,27 +37,28 @@ jobs:
               mavenCentral()
             }
           }
-          rootProject.name = "APKCreate"
+          rootProject.name = "MJAudioPlayer"
           include ':app'
           EOF
+
           cat > gradle.properties <<'EOF'
           android.useAndroidX=true
           org.gradle.jvmargs=-Xmx2g
           EOF
+
           cat > app/build.gradle <<'EOF'
-          plugins { id 'com.android.application' version '8.2.2' }
+          plugins {
+            id 'com.android.application' version '8.2.2'
+          }
           android {
-            namespace 'com.apk.create'
+            namespace 'com.mjaudio.player'
             compileSdk 34
             defaultConfig {
-              applicationId 'com.apk.create'
+              applicationId 'com.mjaudio.player'
               minSdk 24
               targetSdk 34
               versionCode 1
               versionName '1.0'
-              ndk {
-                abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
-              }
             }
             compileOptions {
               sourceCompatibility JavaVersion.VERSION_17
@@ -69,33 +71,37 @@ jobs:
             }
           }
           EOF
+
           cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
             <uses-permission android:name="android.permission.INTERNET" />
             <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-            <uses-permission android:name="android.permission.CAMERA" />
-            <uses-permission android:name="android.permission.RECORD_AUDIO" />
             <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
             <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+            <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+            <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
             <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
             <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
-            <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
             <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-            <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-            <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-            <uses-permission android:name="android.permission.BLUETOOTH" />
-            <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-            <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
-            <uses-permission android:name="android.permission.READ_CONTACTS" />
-            <uses-permission android:name="android.permission.READ_SMS" />
-            <uses-permission android:name="android.permission.SEND_SMS" />
-            <uses-permission android:name="android.permission.CALL_PHONE" />
-            <uses-permission android:name="android.permission.VIBRATE" />
             <uses-permission android:name="android.permission.WAKE_LOCK" />
             <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+            <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
             <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-            <application android:label="APK Create">
-              <activity android:name=".MainActivity" android:exported="true">
+            <uses-permission android:name="android.permission.VIBRATE" />
+            <uses-permission android:name="android.permission.BLUETOOTH" />
+            <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+            <application
+              android:label="MJ Audio Player"
+              android:requestLegacyExternalStorage="true"
+              android:usesCleartextTraffic="true">
+              <activity
+                android:name=".MainActivity"
+                android:exported="true"
+                android:launchMode="singleTop"
+                android:configChanges="orientation|screenSize|keyboardHidden">
                 <intent-filter>
                   <action android:name="android.intent.action.MAIN" />
                   <category android:name="android.intent.category.LAUNCHER" />
@@ -104,300 +110,2398 @@ jobs:
             </application>
           </manifest>
           EOF
-          cat > app/src/main/java/com/apk/create/MainActivity.java <<'EOF'
-          package com.apk.create;
+
+          cat > app/src/main/java/com/mjaudio/player/MainActivity.java <<'EOF'
+          package com.mjaudio.player;
+
           import android.app.Activity;
           import android.app.AlertDialog;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.ProgressDialog;
+          import android.content.BroadcastReceiver;
+          import android.content.ContentResolver;
+          import android.content.Context;
+          import android.content.DialogInterface;
           import android.content.Intent;
+          import android.content.IntentFilter;
           import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.database.Cursor;
+          import android.media.AudioManager;
+          import android.media.MediaMetadataRetriever;
+          import android.media.MediaPlayer;
+          import android.media.MediaScannerConnection;
+          import android.media.PlaybackParams;
+          import android.media.audiofx.BassBoost;
+          import android.media.audiofx.Equalizer;
+          import android.media.audiofx.LoudnessEnhancer;
+          import android.media.audiofx.Virtualizer;
+          import android.media.session.MediaSession;
+          import android.media.session.PlaybackState;
           import android.net.Uri;
+          import android.os.Build;
           import android.os.Bundle;
-          import android.text.Editable;
-          import android.text.TextWatcher;
-          import android.view.Menu;
-          import android.view.MenuItem;
-          import android.widget.*;
-          import java.util.*;
+          import android.os.Environment;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.PowerManager;
+          import android.os.StrictMode;
+          import android.provider.MediaStore;
+          import android.provider.Settings;
+          import android.text.InputType;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.AdapterView;
+          import android.widget.ArrayAdapter;
+          import android.widget.Button;
+          import android.widget.CheckBox;
+          import android.widget.EditText;
+          import android.widget.FrameLayout;
+          import android.widget.GridView;
+          import android.widget.HorizontalScrollView;
+          import android.widget.LinearLayout;
+          import android.widget.ListView;
+          import android.widget.ScrollView;
+          import android.widget.SeekBar;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.io.File;
+          import java.io.OutputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.net.URLEncoder;
+          import java.nio.charset.StandardCharsets;
+          import java.util.ArrayList;
+          import java.util.Arrays;
+          import java.util.Collections;
+          import java.util.Comparator;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
           public class MainActivity extends Activity {
-              EditText editor;
-              TextView projectNameView;
-              SharedPreferences prefs;
-              Stack<String> undoStack = new Stack<>();
-              Stack<String> redoStack = new Stack<>();
-              boolean isUndoRedo = false;
-              String appName = "My App";
-              String versionName = "1.0";
-              String versionCode = "1";
-              String sdkMin = "24";
-              String sdkTarget = "34";
-              String packageName = "com.apk.myapp";
-              String author = "";
-              String theme = "Theme";
-              boolean isDebug = true;
-              String serverLink = "";
-              String githubToken = "";
-              String[] allPermissions = {
-                  "android.permission.ACCESS_BACKGROUND_LOCATION",
-                  "android.permission.ACCESS_COARSE_LOCATION",
-                  "android.permission.ACCESS_FINE_LOCATION",
-                  "android.permission.ACCESS_MEDIA_LOCATION",
-                  "android.permission.ACCESS_NETWORK_STATE",
-                  "android.permission.ACCESS_WIFI_STATE",
-                  "android.permission.ANSWER_PHONE_CALLS",
-                  "android.permission.BATTERY_STATS",
-                  "android.permission.BLUETOOTH",
-                  "android.permission.BLUETOOTH_ADMIN",
-                  "android.permission.BLUETOOTH_ADVERTISE",
-                  "android.permission.BLUETOOTH_CONNECT",
-                  "android.permission.BLUETOOTH_SCAN",
-                  "android.permission.CAMERA",
-                  "android.permission.CHANGE_NETWORK_STATE",
-                  "android.permission.CHANGE_WIFI_STATE",
-                  "android.permission.CLEAR_APP_CACHE",
-                  "android.permission.DOWNLOAD_WITHOUT_NOTIFICATION",
-                  "android.permission.FOREGROUND_SERVICE",
-                  "android.permission.GET_PACKAGE_SIZE",
-                  "android.permission.INSTALL_SHORTCUT",
-                  "android.permission.INTERNET",
-                  "android.permission.KILL_BACKGROUND_PROCESSES",
-                  "android.permission.MANAGE_EXTERNAL_STORAGE",
-                  "android.permission.POST_NOTIFICATIONS",
-                  "android.permission.READ_CALL_LOG",
-                  "android.permission.READ_CONTACTS",
-                  "android.permission.READ_EXTERNAL_STORAGE",
-                  "android.permission.READ_FRAME_BUFFER",
-                  "android.permission.READ_LOGS",
-                  "android.permission.READ_MEDIA_AUDIO",
-                  "android.permission.READ_MEDIA_IMAGES",
-                  "android.permission.READ_MEDIA_VIDEO",
-                  "android.permission.READ_PHONE_STATE",
-                  "android.permission.READ_SMS",
-                  "android.permission.RECORD_AUDIO",
-                  "android.permission.REQUEST_INSTALL_PACKAGES",
-                  "android.permission.SEND_SMS",
-                  "android.permission.SET_WALLPAPER",
-                  "android.permission.SYSTEM_ALERT_WINDOW",
-                  "android.permission.VIBRATE",
-                  "android.permission.WAKE_LOCK",
-                  "android.permission.WRITE_CALL_LOG",
-                  "android.permission.WRITE_CONTACTS",
-                  "android.permission.WRITE_EXTERNAL_STORAGE",
-                  "android.permission.WRITE_SETTINGS",
-                  "android.permission.WRITE_SMS",
-                  "android.permission.ACCESS_NOTIFICATION_POLICY",
-                  "android.permission.MODIFY_AUDIO_SETTINGS",
-                  "android.permission.RECEIVE_BOOT_COMPLETED",
-                  "android.permission.RECEIVE_SMS",
-                  "android.permission.USE_BIOMETRIC",
-                  "android.permission.NFC",
-                  "android.permission.FLASHLIGHT",
-                  "android.permission.CALL_PHONE"
-              };
-              boolean[] checkedPermissions;
+
+              static class AudioItem {
+                  String name;
+                  String path;
+                  long dateAdded;
+                  long size;
+                  long duration;
+
+                  AudioItem(String name, String path, long dateAdded, long size, long duration) {
+                      this.name = name;
+                      this.path = path;
+                      this.dateAdded = dateAdded;
+                      this.size = size;
+                      this.duration = duration;
+                  }
+              }
+
+              static class FolderInfo {
+                  String name;
+                  String path;
+                  int count;
+
+                  FolderInfo(String name, String path, int count) {
+                      this.name = name;
+                      this.path = path;
+                      this.count = count;
+                  }
+              }
+
+              static class BrowserItem {
+                  String name;
+                  String path;
+                  boolean isDir;
+                  boolean isGoBack;
+                  long dateAdded;
+
+                  BrowserItem(String name, String path, boolean isDir, boolean isGoBack, long dateAdded) {
+                      this.name = name;
+                      this.path = path;
+                      this.isDir = isDir;
+                      this.isGoBack = isGoBack;
+                      this.dateAdded = dateAdded;
+                  }
+              }
+
+              // Global persistent audio engine instances
+              private static MediaPlayer mediaPlayer;
+              private static MediaPlayer echoPlayer;
+              private static MediaSession mediaSession;
+              private static Equalizer globalEq;
+              private static BassBoost globalBass;
+              private static Virtualizer globalVirt;
+              private static LoudnessEnhancer globalLoudness;
+
+              private Context ctx;
+              private SharedPreferences prefs;
+              private SharedPreferences pinnedPrefs;
+              private SharedPreferences favPrefs;
+              private SharedPreferences tagsPrefs;
+              private SharedPreferences recentPrefs;
+              private SharedPreferences playlistsPrefs;
+              private SharedPreferences trashPrefs;
+
+              private int skipDuration = 10000;
+              private boolean backgroundPlay = true;
+              private boolean singleLoop = false;
+              private float currentPlaybackSpeed = 1.0f;
+              private String currentVoiceEffect = "Normal";
+              private String currentSortOrder = "Date (Newest First)";
+              private int volumeBoostLevel = 0;
+              private int currentEqPreset = -1;
+
+              private boolean showFavoritesOnly = false;
+              private boolean showRecentOnly = false;
+              private String currentPlaylistFilter = null;
+              private boolean showTrashOnly = false;
+              private String currentSearchQuery = "";
+              private boolean isGridView = false;
+
+              // A-B Repeat variables
+              private int abRepeatState = 0; // 0: Off, 1: A Set, 2: B Set
+              private int abPointA = 0;
+              private int abPointB = 0;
+              private boolean isUserSeeking = false;
+
+              private List<AudioItem> audioList = new ArrayList<>();
+              private List<AudioItem> displayList = new ArrayList<>();
+              private int currentIndex = -1;
+              private boolean isPlaying = false;
+              private String currentFolderFilter = "ALL";
+              private final int[] customEqBands = new int[]{0, 0, 0, 0, 0};
+
+              // UI elements
+              private TextView fileCountView;
+              private TextView currentFolderView;
+              private LinearLayout searchRowLayout;
+              private EditText searchInput;
+              private ListView listView;
+              private GridView gridView;
+              private TextView trackStatusView;
+              private TextView timeCurrent;
+              private SeekBar seekBar;
+              private TextView timeTotal;
+              private Button btnFavs;
+              private Button btnViewMode;
+              private Button btnABRepeat;
+              private Button btnPlayPause;
+              private Button btnSpeed;
+              private Button btnFolders;
+
+              private AlertDialog fileBrowserDialog = null;
+              private final Handler updateHandler = new Handler(Looper.getMainLooper());
+              private Runnable updateRunnable;
+              private final Handler sleepTimerHandler = new Handler(Looper.getMainLooper());
+              private Runnable sleepTimerRunnable = null;
+              private BroadcastReceiver notificationReceiver;
+
               @Override
-              protected void onCreate(Bundle b) {
-                  super.onCreate(b);
-                  prefs = getSharedPreferences("APKCreate", MODE_PRIVATE);
-                  checkedPermissions = new boolean[allPermissions.length];
-                  serverLink = prefs.getString("server_link", "");
-                  githubToken = prefs.getString("github_token", "");
-                  appName = prefs.getString("app_name", "My App");
-                  packageName = prefs.getString("package_name", "com.apk.myapp");
-                  LinearLayout main = new LinearLayout(this);
-                  main.setOrientation(LinearLayout.VERTICAL);
-                  projectNameView = new TextView(this);
-                  projectNameView.setText("Project: " + appName);
-                  projectNameView.setTextSize(18);
-                  projectNameView.setPadding(20, 20, 20, 20);
-                  main.addView(projectNameView);
-                  editor = new EditText(this);
-                  editor.setHint("Yahan apna JAVA code paste karein...");
-                  editor.setMinLines(20);
-                  editor.setGravity(android.view.Gravity.TOP);
-                  editor.setText(prefs.getString("last_code", ""));
-                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, 0, 1f);
-                  main.addView(editor, lp);
-                  LinearLayout btnRow = new LinearLayout(this);
-                  btnRow.setOrientation(LinearLayout.HORIZONTAL);
-                  Button undoBtn = new Button(this); undoBtn.setText("Undo");
-                  Button redoBtn = new Button(this); redoBtn.setText("Redo");
-                  Button runBtn = new Button(this); runBtn.setText("Run / Check");
-                  Button saveBtn = new Button(this); saveBtn.setText("Save");
-                  btnRow.addView(undoBtn); btnRow.addView(redoBtn);
-                  btnRow.addView(runBtn); btnRow.addView(saveBtn);
-                  main.addView(btnRow);
-                  undoBtn.setOnClickListener(v -> doUndo());
-                  redoBtn.setOnClickListener(v -> doRedo());
-                  runBtn.setOnClickListener(v -> checkCode());
-                  saveBtn.setOnClickListener(v -> {
-                      prefs.edit().putString("last_code", editor.getText().toString()).apply();
-                      Toast.makeText(this, "Project Saved!", Toast.LENGTH_SHORT).show();
-                  });
-                  editor.addTextChangedListener(new TextWatcher() {
-                      public void beforeTextChanged(CharSequence s, int st, int c, int a) {}
-                      public void onTextChanged(CharSequence s, int st, int b, int c) {}
-                      public void afterTextChanged(Editable s) {
-                          if (!isUndoRedo) { undoStack.push(s.toString()); redoStack.clear(); }
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  ctx = this;
+
+                  prefs = ctx.getSharedPreferences("AudioPlayerProPrefs", Context.MODE_PRIVATE);
+                  pinnedPrefs = ctx.getSharedPreferences("PinnedFoldersPrefs", Context.MODE_PRIVATE);
+                  favPrefs = ctx.getSharedPreferences("AudioFavPrefs", Context.MODE_PRIVATE);
+                  tagsPrefs = ctx.getSharedPreferences("AudioTagsPrefs", Context.MODE_PRIVATE);
+                  recentPrefs = ctx.getSharedPreferences("AudioRecentPrefs", Context.MODE_PRIVATE);
+                  playlistsPrefs = ctx.getSharedPreferences("AudioPlaylistsPrefs", Context.MODE_PRIVATE);
+                  trashPrefs = ctx.getSharedPreferences("AudioTrashPrefs", Context.MODE_PRIVATE);
+
+                  skipDuration = prefs.getInt("skipDuration", 10000);
+                  backgroundPlay = prefs.getBoolean("backgroundPlay", true);
+                  singleLoop = prefs.getBoolean("singleLoop", false);
+                  currentPlaybackSpeed = prefs.getFloat("playbackSpeed", 1.0f);
+                  currentSortOrder = prefs.getString("sortOrder", "Date (Newest First)");
+                  volumeBoostLevel = prefs.getInt("volBoost", 0);
+                  currentEqPreset = prefs.getInt("eqPreset", -1);
+                  for (int i = 0; i < 5; i++) {
+                      customEqBands[i] = prefs.getInt("custEqBand" + (i + 1), 0);
+                  }
+
+                  requestRequiredPermissions();
+                  createNotificationChannel();
+
+                  if (mediaPlayer == null) {
+                      mediaPlayer = new MediaPlayer();
+                      try {
+                          mediaPlayer.setWakeMode(getApplicationContext(), PowerManager.PARTIAL_WAKE_LOCK);
+                      } catch (Throwable ignored) {}
+                  }
+                  try {
+                      isPlaying = mediaPlayer.isPlaying();
+                  } catch (Throwable ignored) {}
+
+                  buildUI();
+                  setupAudioFocus();
+                  registerNotificationReceiver();
+                  setupMediaPlayerCompletion();
+                  startProgressUpdater();
+
+                  scanAudioFiles();
+              }
+
+              private void requestRequiredPermissions() {
+                  if (Build.VERSION.SDK_INT >= 30) {
+                      if (!Environment.isExternalStorageManager()) {
+                          if (!prefs.getBoolean("askedAllFiles", false)) {
+                              prefs.edit().putBoolean("askedAllFiles", true).apply();
+                              try {
+                                  Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+                                  intent.setData(Uri.parse("package:" + getPackageName()));
+                                  startActivity(intent);
+                              } catch (Throwable ignored) {}
+                          }
+                      }
+                  }
+
+                  try {
+                      if (Build.VERSION.SDK_INT >= 23) {
+                          List<String> permsToAsk = new ArrayList<>();
+                          if (Build.VERSION.SDK_INT >= 33) {
+                              if (checkSelfPermission("android.permission.READ_MEDIA_AUDIO") != PackageManager.PERMISSION_GRANTED) {
+                                  permsToAsk.add("android.permission.READ_MEDIA_AUDIO");
+                              }
+                              if (checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+                                  permsToAsk.add("android.permission.POST_NOTIFICATIONS");
+                              }
+                          } else {
+                              if (checkSelfPermission("android.permission.READ_EXTERNAL_STORAGE") != PackageManager.PERMISSION_GRANTED) {
+                                  permsToAsk.add("android.permission.READ_EXTERNAL_STORAGE");
+                                  permsToAsk.add("android.permission.WRITE_EXTERNAL_STORAGE");
+                              }
+                          }
+                          if (!permsToAsk.isEmpty()) {
+                              boolean askedAlready = prefs.getBoolean("StrictPermCheck", false);
+                              if (!askedAlready) {
+                                  prefs.edit().putBoolean("StrictPermCheck", true).apply();
+                                  requestPermissions(permsToAsk.toArray(new String[0]), 1);
+                              }
+                          }
+                      }
+                  } catch (Throwable ignored) {}
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  if (requestCode == 1) {
+                      scanAudioFiles();
+                  }
+              }
+
+              private void createNotificationChannel() {
+                  try {
+                      if (Build.VERSION.SDK_INT >= 26) {
+                          NotificationChannel channel = new NotificationChannel(
+                                  "audio_channel", "MJ Audio Playback", NotificationManager.IMPORTANCE_LOW);
+                          NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+                          if (nm != null) nm.createNotificationChannel(channel);
+                      }
+                  } catch (Throwable ignored) {}
+              }
+
+              private void buildUI() {
+                  LinearLayout mainLayout = new LinearLayout(ctx);
+                  mainLayout.setOrientation(LinearLayout.VERTICAL);
+                  mainLayout.setLayoutParams(new LinearLayout.LayoutParams(-1, -1));
+                  mainLayout.setPadding(16, 16, 16, 16);
+
+                  TextView titleView = new TextView(ctx);
+                  titleView.setText("MJ Audio Player");
+                  titleView.setTextSize(22);
+                  titleView.setTextColor(0xFF1E88E5);
+                  titleView.setGravity(Gravity.CENTER);
+                  mainLayout.addView(titleView);
+
+                  TextView devView = new TextView(ctx);
+                  devView.setText("Developer: Jahbaz hijbani");
+                  devView.setTextSize(14);
+                  devView.setGravity(Gravity.CENTER);
+                  devView.setPadding(0, 0, 0, 15);
+                  mainLayout.addView(devView);
+
+                  LinearLayout topBarLayout = new LinearLayout(ctx);
+                  topBarLayout.setOrientation(LinearLayout.VERTICAL);
+
+                  HorizontalScrollView topButtonScroll = new HorizontalScrollView(ctx);
+                  topButtonScroll.setHorizontalScrollBarEnabled(false);
+                  LinearLayout topButtonRow = new LinearLayout(ctx);
+                  topButtonRow.setOrientation(LinearLayout.HORIZONTAL);
+
+                  Button btnSearchTop = new Button(ctx);
+                  btnSearchTop.setText("Search");
+                  topButtonRow.addView(btnSearchTop);
+
+                  Button btnAllFiles = new Button(ctx);
+                  btnAllFiles.setText("All Files");
+                  topButtonRow.addView(btnAllFiles);
+
+                  Button btnSort = new Button(ctx);
+                  btnSort.setText("Sort");
+                  topButtonRow.addView(btnSort);
+
+                  btnFavs = new Button(ctx);
+                  btnFavs.setText("Favorites");
+                  topButtonRow.addView(btnFavs);
+
+                  btnViewMode = new Button(ctx);
+                  btnViewMode.setText("View: List");
+                  topButtonRow.addView(btnViewMode);
+
+                  topButtonScroll.addView(topButtonRow);
+                  topBarLayout.addView(topButtonScroll);
+
+                  LinearLayout folderRowLayout = new LinearLayout(ctx);
+                  folderRowLayout.setOrientation(LinearLayout.HORIZONTAL);
+
+                  btnFolders = new Button(ctx);
+                  btnFolders.setText("Folders");
+                  folderRowLayout.addView(btnFolders);
+
+                  Button btnRecent = new Button(ctx);
+                  btnRecent.setText("Recent");
+                  folderRowLayout.addView(btnRecent);
+
+                  Button btnPlaylists = new Button(ctx);
+                  btnPlaylists.setText("Playlists");
+                  folderRowLayout.addView(btnPlaylists);
+
+                  topBarLayout.addView(folderRowLayout);
+
+                  fileCountView = new TextView(ctx);
+                  fileCountView.setGravity(Gravity.CENTER_VERTICAL);
+                  fileCountView.setPadding(20, 10, 0, 0);
+                  topBarLayout.addView(fileCountView);
+
+                  currentFolderView = new TextView(ctx);
+                  currentFolderView.setText("Current: All Audio Files");
+                  currentFolderView.setTextSize(14);
+                  currentFolderView.setTextColor(0xFF4CAF50);
+                  currentFolderView.setPadding(0, 5, 0, 10);
+                  topBarLayout.addView(currentFolderView);
+
+                  mainLayout.addView(topBarLayout);
+
+                  searchRowLayout = new LinearLayout(ctx);
+                  searchRowLayout.setOrientation(LinearLayout.HORIZONTAL);
+                  searchRowLayout.setVisibility(View.GONE);
+                  searchInput = new EditText(ctx);
+                  searchInput.setHint("Search...");
+                  searchInput.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+                  searchRowLayout.addView(searchInput);
+                  Button btnSearchQuery = new Button(ctx);
+                  btnSearchQuery.setText("Find");
+                  searchRowLayout.addView(btnSearchQuery);
+                  mainLayout.addView(searchRowLayout);
+
+                  FrameLayout listContainer = new FrameLayout(ctx);
+                  listContainer.setLayoutParams(new LinearLayout.LayoutParams(-1, 0, 1));
+
+                  listView = new ListView(ctx);
+                  listView.setLayoutParams(new FrameLayout.LayoutParams(-1, -1));
+                  listContainer.addView(listView);
+
+                  gridView = new GridView(ctx);
+                  gridView.setNumColumns(2);
+                  gridView.setLayoutParams(new FrameLayout.LayoutParams(-1, -1));
+                  gridView.setVisibility(View.GONE);
+                  listContainer.addView(gridView);
+
+                  mainLayout.addView(listContainer);
+
+                  // Bottom Controls
+                  LinearLayout bottomControlsContainer = new LinearLayout(ctx);
+                  bottomControlsContainer.setOrientation(LinearLayout.VERTICAL);
+                  bottomControlsContainer.setLayoutParams(new LinearLayout.LayoutParams(-1, -2));
+
+                  trackStatusView = new TextView(ctx);
+                  trackStatusView.setText("No Audio Selected");
+                  trackStatusView.setGravity(Gravity.CENTER);
+                  trackStatusView.setPadding(0, 8, 0, 8);
+                  bottomControlsContainer.addView(trackStatusView);
+
+                  LinearLayout seekBarLayout = new LinearLayout(ctx);
+                  seekBarLayout.setOrientation(LinearLayout.HORIZONTAL);
+                  seekBarLayout.setGravity(Gravity.CENTER_VERTICAL);
+
+                  timeCurrent = new TextView(ctx);
+                  timeCurrent.setText("00:00");
+                  seekBarLayout.addView(timeCurrent);
+
+                  seekBar = new SeekBar(ctx);
+                  seekBar.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+                  seekBarLayout.addView(seekBar);
+
+                  timeTotal = new TextView(ctx);
+                  timeTotal.setText("00:00");
+                  seekBarLayout.addView(timeTotal);
+
+                  bottomControlsContainer.addView(seekBarLayout);
+
+                  LinearLayout extraControlsRow = new LinearLayout(ctx);
+                  extraControlsRow.setOrientation(LinearLayout.HORIZONTAL);
+                  extraControlsRow.setGravity(Gravity.CENTER);
+
+                  Button btnGoTo = new Button(ctx);
+                  btnGoTo.setText("Go To Time");
+                  btnGoTo.setPadding(10, 0, 10, 0);
+                  btnGoTo.setTextSize(12);
+                  LinearLayout.LayoutParams btnGoToParams = new LinearLayout.LayoutParams(-2, -2);
+                  btnGoToParams.setMargins(5, 0, 5, 0);
+                  btnGoTo.setLayoutParams(btnGoToParams);
+                  extraControlsRow.addView(btnGoTo);
+
+                  btnABRepeat = new Button(ctx);
+                  btnABRepeat.setText("A-B Repeat");
+                  btnABRepeat.setPadding(10, 0, 10, 0);
+                  btnABRepeat.setTextSize(12);
+                  LinearLayout.LayoutParams btnABParams = new LinearLayout.LayoutParams(-2, -2);
+                  btnABParams.setMargins(5, 0, 5, 0);
+                  btnABRepeat.setLayoutParams(btnABParams);
+                  extraControlsRow.addView(btnABRepeat);
+
+                  bottomControlsContainer.addView(extraControlsRow);
+
+                  LinearLayout controlsLayout = new LinearLayout(ctx);
+                  controlsLayout.setOrientation(LinearLayout.HORIZONTAL);
+                  controlsLayout.setLayoutParams(new LinearLayout.LayoutParams(-1, -2));
+                  controlsLayout.setGravity(Gravity.CENTER);
+
+                  Button btnPrev = createControlButton("Prev");
+                  Button btnRewind = createControlButton("Rewind");
+                  btnPlayPause = createControlButton(isPlaying ? "Pause" : "Play");
+                  Button btnForward = createControlButton("Forward");
+                  Button btnNext = createControlButton("Next");
+
+                  controlsLayout.addView(btnPrev);
+                  controlsLayout.addView(btnRewind);
+                  controlsLayout.addView(btnPlayPause);
+                  controlsLayout.addView(btnForward);
+                  controlsLayout.addView(btnNext);
+                  bottomControlsContainer.addView(controlsLayout);
+
+                  LinearLayout bottomLayout = new LinearLayout(ctx);
+                  bottomLayout.setOrientation(LinearLayout.HORIZONTAL);
+                  bottomLayout.setGravity(Gravity.CENTER);
+
+                  Button btnSettings = createBottomButton("Settings");
+                  Button btnVoice = createBottomButton("Voice FX");
+                  Button btnCustomEq = createBottomButton("Custom Equalizer");
+                  btnSpeed = createBottomButton("Speed: " + currentPlaybackSpeed + "x");
+
+                  bottomLayout.addView(btnSettings);
+                  bottomLayout.addView(btnVoice);
+                  bottomLayout.addView(btnCustomEq);
+                  bottomLayout.addView(btnSpeed);
+
+                  bottomControlsContainer.addView(bottomLayout);
+                  mainLayout.addView(bottomControlsContainer);
+
+                  setContentView(mainLayout);
+
+                  // Listeners
+                  btnSearchTop.setOnClickListener(v -> {
+                      if (searchRowLayout.getVisibility() == View.VISIBLE) {
+                          searchRowLayout.setVisibility(View.GONE);
+                          currentSearchQuery = "";
+                          searchInput.setText("");
+                          refreshListView();
+                      } else {
+                          searchRowLayout.setVisibility(View.VISIBLE);
+                          searchInput.requestFocus();
                       }
                   });
-                  setContentView(main);
+
+                  btnSearchQuery.setOnClickListener(v -> {
+                      currentSearchQuery = searchInput.getText().toString().toLowerCase(Locale.ROOT).trim();
+                      refreshListView();
+                  });
+
+                  btnViewMode.setOnClickListener(v -> {
+                      isGridView = !isGridView;
+                      if (isGridView) {
+                          btnViewMode.setText("View: Grid");
+                          listView.setVisibility(View.GONE);
+                          gridView.setVisibility(View.VISIBLE);
+                      } else {
+                          btnViewMode.setText("View: List");
+                          gridView.setVisibility(View.GONE);
+                          listView.setVisibility(View.VISIBLE);
+                      }
+                  });
+
+                  btnFavs.setOnClickListener(v -> {
+                      showFavoritesOnly = !showFavoritesOnly;
+                      showRecentOnly = false;
+                      currentPlaylistFilter = null;
+                      showTrashOnly = false;
+                      btnFavs.setText(showFavoritesOnly ? "All Audio" : "Favorites");
+                      refreshListView();
+                  });
+
+                  btnRecent.setOnClickListener(v -> {
+                      showRecentOnly = !showRecentOnly;
+                      showFavoritesOnly = false;
+                      currentPlaylistFilter = null;
+                      showTrashOnly = false;
+                      refreshListView();
+                  });
+
+                  btnPlaylists.setOnClickListener(v -> showPlaylistsDialog());
+                  btnGoTo.setOnClickListener(v -> showGoToTimeDialog());
+                  btnABRepeat.setOnClickListener(v -> handleABRepeat());
+                  btnSort.setOnClickListener(v -> showSortDialog());
+                  btnCustomEq.setOnClickListener(v -> showCustomEqDialog());
+                  btnAllFiles.setOnClickListener(v -> showStorageSelectorDialog());
+                  btnFolders.setOnClickListener(v -> showFoldersDialog());
+                  btnVoice.setOnClickListener(v -> showVoiceEffectsDialog());
+                  btnSpeed.setOnClickListener(v -> showSpeedDialog());
+                  btnSettings.setOnClickListener(v -> showSettingsDialog());
+
+                  btnPlayPause.setOnClickListener(v -> togglePlayPause());
+                  btnPrev.setOnClickListener(v -> playPreviousTrack());
+                  btnNext.setOnClickListener(v -> playNextTrack());
+                  btnRewind.setOnClickListener(v -> seekAndUpdate(-skipDuration));
+                  btnForward.setOnClickListener(v -> seekAndUpdate(skipDuration));
+
+                  AdapterView.OnItemClickListener itemClickListener = (parent, view, position, id) -> playAudioAtIndex(position);
+                  listView.setOnItemClickListener(itemClickListener);
+                  gridView.setOnItemClickListener(itemClickListener);
+
+                  AdapterView.OnItemLongClickListener itemLongClickListener = (parent, view, position, id) -> onAudioItemLongClick(position);
+                  listView.setOnItemLongClickListener(itemLongClickListener);
+                  gridView.setOnItemLongClickListener(itemLongClickListener);
+
+                  seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      @Override
+                      public void onProgressChanged(SeekBar sb, int progress, boolean fromUser) {
+                          if (fromUser) {
+                              timeCurrent.setText(formatDuration(progress));
+                          }
+                      }
+
+                      @Override
+                      public void onStartTrackingTouch(SeekBar sb) {
+                          isUserSeeking = true;
+                      }
+
+                      @Override
+                      public void onStopTrackingTouch(SeekBar sb) {
+                          isUserSeeking = false;
+                          if (mediaPlayer != null) {
+                              try {
+                                  int pos = sb.getProgress();
+                                  mediaPlayer.seekTo(pos);
+                                  timeCurrent.setText(formatDuration(pos));
+                                  if (isPlaying) applyVoiceAndSpeed();
+                                  if (currentIndex >= 0 && currentIndex < displayList.size()) {
+                                      prefs.edit().putInt("pos_" + displayList.get(currentIndex).path, pos).apply();
+                                  }
+                              } catch (Throwable ignored) {}
+                          }
+                      }
+                  });
               }
-              void doUndo() {
-                  if (!undoStack.isEmpty()) {
-                      isUndoRedo = true;
-                      redoStack.push(editor.getText().toString());
-                      editor.setText(undoStack.pop());
-                      isUndoRedo = false;
+
+              private Button createControlButton(String text) {
+                  Button btn = new Button(ctx);
+                  btn.setText(text);
+                  btn.setTextSize(10);
+                  btn.setPadding(4, 8, 4, 8);
+                  LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -2, 1.0f);
+                  params.setMargins(2, 2, 2, 2);
+                  btn.setLayoutParams(params);
+                  return btn;
+              }
+
+              private Button createBottomButton(String text) {
+                  Button btn = new Button(ctx);
+                  btn.setText(text);
+                  btn.setTextSize(10);
+                  LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -2, 1.0f);
+                  params.setMargins(2, 5, 2, 5);
+                  btn.setLayoutParams(params);
+                  return btn;
+              }
+
+              private void setupAudioFocus() {
+                  try {
+                      AudioManager audioManager = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
+                      if (audioManager != null) {
+                          audioManager.requestAudioFocus(focusChange -> {
+                              try {
+                                  if (focusChange == AudioManager.AUDIOFOCUS_LOSS
+                                          || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
+                                      if (mediaPlayer != null && mediaPlayer.isPlaying()) {
+                                          btnPlayPause.performClick();
+                                      }
+                                  }
+                              } catch (Throwable ignored) {}
+                          }, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
+                      }
+                  } catch (Throwable ignored) {}
+              }
+
+              private void registerNotificationReceiver() {
+                  notificationReceiver = new BroadcastReceiver() {
+                      @Override
+                      public void onReceive(Context context, Intent intent) {
+                          try {
+                              if (intent == null || intent.getAction() == null) return;
+                              String action = intent.getAction();
+                              if ("JAHBAZ_ACTION_PREV".equals(action)) {
+                                  playPreviousTrack();
+                              } else if ("JAHBAZ_ACTION_REWIND".equals(action)) {
+                                  seekAndUpdate(-skipDuration);
+                              } else if ("JAHBAZ_ACTION_PLAY".equals(action)) {
+                                  btnPlayPause.performClick();
+                              } else if ("JAHBAZ_ACTION_FORWARD".equals(action)) {
+                                  seekAndUpdate(skipDuration);
+                              } else if ("JAHBAZ_ACTION_NEXT".equals(action)) {
+                                  playNextTrack();
+                              } else if ("JAHBAZ_ACTION_CLOSE".equals(action)) {
+                                  try {
+                                      if (mediaPlayer != null) {
+                                          if (mediaPlayer.isPlaying()) mediaPlayer.stop();
+                                          mediaPlayer.reset();
+                                      }
+                                      stopEchoPlayer();
+                                      isPlaying = false;
+                                      btnPlayPause.setText("Play");
+                                      trackStatusView.setText("Playback Stopped");
+                                      NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+                                      if (nm != null) nm.cancel(111);
+                                      if (mediaSession != null) {
+                                          mediaSession.setActive(false);
+                                      }
+                                  } catch (Throwable ignored) {}
+                              }
+                          } catch (Throwable ignored) {}
+                      }
+                  };
+
+                  IntentFilter filter = new IntentFilter();
+                  filter.addAction("JAHBAZ_ACTION_PREV");
+                  filter.addAction("JAHBAZ_ACTION_REWIND");
+                  filter.addAction("JAHBAZ_ACTION_PLAY");
+                  filter.addAction("JAHBAZ_ACTION_FORWARD");
+                  filter.addAction("JAHBAZ_ACTION_NEXT");
+                  filter.addAction("JAHBAZ_ACTION_CLOSE");
+                  try {
+                      if (Build.VERSION.SDK_INT >= 33) {
+                          ctx.registerReceiver(notificationReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+                      } else {
+                          ctx.registerReceiver(notificationReceiver, filter);
+                      }
+                  } catch (Throwable ignored) {}
+              }
+
+              private void setupMediaPlayerCompletion() {
+                  mediaPlayer.setOnCompletionListener(mp -> {
+                      stopEchoPlayer();
+                      if (currentIndex >= 0 && currentIndex < displayList.size()) {
+                          prefs.edit().putInt("pos_" + displayList.get(currentIndex).path, 0).apply();
+                      }
+                      if (singleLoop) {
+                          playAudioAtIndex(currentIndex);
+                      } else if (currentIndex >= 0 && currentIndex < displayList.size() - 1) {
+                          playAudioAtIndex(currentIndex + 1);
+                      } else {
+                          isPlaying = false;
+                          btnPlayPause.setText("Play");
+                          trackStatusView.setText("Playback Finished");
+                          if (currentIndex >= 0 && currentIndex < displayList.size()) {
+                              updateNotification(displayList.get(currentIndex), false);
+                          }
+                      }
+                  });
+              }
+
+              private void startProgressUpdater() {
+                  updateRunnable = new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              if (mediaPlayer != null && mediaPlayer.isPlaying()) {
+                                  int current = mediaPlayer.getCurrentPosition();
+                                  if (!isUserSeeking) {
+                                      seekBar.setProgress(current);
+                                      timeCurrent.setText(formatDuration(current));
+                                  }
+
+                                  // A-B Repeat Logic
+                                  if (abRepeatState == 2 && current >= abPointB) {
+                                      mediaPlayer.seekTo(abPointA);
+                                      seekBar.setProgress(abPointA);
+                                      timeCurrent.setText(formatDuration(abPointA));
+                                  }
+
+                                  if (currentIndex >= 0 && currentIndex < displayList.size()) {
+                                      prefs.edit().putInt("pos_" + displayList.get(currentIndex).path, current).apply();
+                                  }
+                              }
+                          } catch (Throwable ignored) {}
+                          updateHandler.postDelayed(this, 250);
+                      }
+                  };
+                  updateHandler.postDelayed(updateRunnable, 250);
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (isPlaying && backgroundPlay) {
+                      moveTaskToBack(true);
+                  } else {
+                      super.onBackPressed();
                   }
               }
-              void doRedo() {
-                  if (!redoStack.isEmpty()) {
-                      isUndoRedo = true;
-                      undoStack.push(editor.getText().toString());
-                      editor.setText(redoStack.pop());
-                      isUndoRedo = false;
+
+              @Override
+              protected void onDestroy() {
+                  super.onDestroy();
+                  if (updateRunnable != null) {
+                      updateHandler.removeCallbacks(updateRunnable);
                   }
+                  if (sleepTimerRunnable != null) {
+                      sleepTimerHandler.removeCallbacks(sleepTimerRunnable);
+                  }
+                  try {
+                      if (notificationReceiver != null) {
+                          ctx.unregisterReceiver(notificationReceiver);
+                      }
+                  } catch (Throwable ignored) {}
               }
-              void checkCode() {
-                  String code = editor.getText().toString();
-                  if (code.isEmpty()) Toast.makeText(this, "Code khali hai!", Toast.LENGTH_SHORT).show();
-                  else if (!code.contains("package")) Toast.makeText(this, "Check: package line missing hai", Toast.LENGTH_LONG).show();
-                  else Toast.makeText(this, "Code OK hai! Ab Build Package dabayein.", Toast.LENGTH_LONG).show();
+
+              private void rescanPath(String filePath) {
+                  try {
+                      MediaScannerConnection.scanFile(ctx, new String[]{filePath}, null, null);
+                  } catch (Throwable ignored) {}
               }
-              @Override
-              public boolean onCreateOptionsMenu(Menu menu) {
-                  menu.add(0, 1, 0, "More Options");
-                  return true;
+
+              private void stopEchoPlayer() {
+                  try {
+                      if (echoPlayer != null) {
+                          if (echoPlayer.isPlaying()) echoPlayer.stop();
+                          echoPlayer.reset();
+                          echoPlayer.release();
+                          echoPlayer = null;
+                      }
+                  } catch (Throwable ignored) {}
               }
-              @Override
-              public boolean onOptionsItemSelected(MenuItem item) {
-                  showMoreOptions();
-                  return true;
-              }
-              void showMoreOptions() {
-                  String[] opts = {"Project - Open", "Project - New", "Build Package", "Export", "Properties", "Token / Server Settings", "About & Support"};
-                  new AlertDialog.Builder(this).setTitle("More Options - APK Create")
-                      .setItems(opts, (d, which) -> {
-                          if (which == 0) openProject();
-                          if (which == 1) newProject();
-                          if (which == 2) buildPackage();
-                          if (which == 3) exportProject();
-                          if (which == 4) showProperties();
-                          if (which == 5) showTokenServer();
-                          if (which == 6) showAbout();
-                      }).show();
-              }
-              void openProject() {
-                  String saved = prefs.getString("project_list", "My App");
-                  Toast.makeText(this, "Recent Projects: " + saved, Toast.LENGTH_LONG).show();
-              }
-              void newProject() {
-                  LinearLayout l = new LinearLayout(this); l.setOrientation(LinearLayout.VERTICAL);
-                  EditText n = new EditText(this); n.setHint("App ka Naam");
-                  EditText p = new EditText(this); p.setHint("Package Name - com.apk.app");
-                  l.addView(n); l.addView(p);
-                  new AlertDialog.Builder(this).setTitle("New Project").setView(l)
-                      .setPositiveButton("Save / OK", (d, w) -> {
-                          if (!n.getText().toString().isEmpty()) appName = n.getText().toString();
-                          if (!p.getText().toString().isEmpty()) packageName = p.getText().toString();
-                          projectNameView.setText("Project: " + appName);
-                          prefs.edit().putString("project_list", appName).putString("app_name", appName).putString("package_name", packageName).apply();
-                          editor.setText("");
-                      }).setNegativeButton("Cancel", null).show();
-              }
-              void showTokenServer() {
-                  LinearLayout l = new LinearLayout(this); l.setOrientation(LinearLayout.VERTICAL);
-                  TextView info = new TextView(this);
-                  info.setText("Yahan Server Link aur Token dalo. Ek baar Save karne ke baad baar baar nahi dalna parega.");
-                  info.setPadding(10, 10, 10, 10);
-                  EditText eLink = new EditText(this);
-                  eLink.setHint("Server Link - https://github.com/user/apk-builder");
-                  eLink.setText(serverLink);
-                  EditText eToken = new EditText(this);
-                  eToken.setHint("GitHub Token yahan likhein");
-                  eToken.setText(githubToken);
-                  l.addView(info); l.addView(eLink); l.addView(eToken);
-                  new AlertDialog.Builder(this).setTitle("Token / Server Settings").setView(l)
-                      .setPositiveButton("Save", (d, w) -> {
-                          serverLink = eLink.getText().toString().trim();
-                          githubToken = eToken.getText().toString().trim();
-                          prefs.edit().putString("server_link", serverLink).putString("github_token", githubToken).apply();
-                          Toast.makeText(this, "Token aur Server Save ho gaya!", Toast.LENGTH_SHORT).show();
-                      }).setNegativeButton("Cancel", null).show();
-              }
-              void buildPackage() {
-                  if (serverLink.isEmpty() || githubToken.isEmpty()) {
-                      Toast.makeText(this, "Pehle More Options > Token / Server Settings me Link aur Token Save karo!", Toast.LENGTH_LONG).show();
-                      showTokenServer();
+
+              private void syncEchoPlayer(int delayMs, float vol, float speed, float pitch) {
+                  if (delayMs <= 0) {
+                      stopEchoPlayer();
                       return;
                   }
-                  new AlertDialog.Builder(this).setTitle("Build Package - APK Create")
-                      .setMessage("App: " + appName + "\nPackage: " + packageName + "\nVersion: " + versionName + " (" + versionCode + ")\nSDK Min: " + sdkMin + " Target: " + sdkTarget + "\nServer: " + serverLink + "\n\nUniversal APK banegi - 32-bit + 64-bit, Android 7 se latest tak chalegi.")
-                      .setPositiveButton("Build Start", (d, w) -> Toast.makeText(this, "Build Started! GitHub par APK ban rahi hai.", Toast.LENGTH_LONG).show())
-                      .show();
+                  try {
+                      if (mediaPlayer == null || !mediaPlayer.isPlaying()
+                              || currentIndex < 0 || currentIndex >= displayList.size()) {
+                          stopEchoPlayer();
+                          return;
+                      }
+                      AudioItem item = displayList.get(currentIndex);
+                      if (echoPlayer == null) {
+                          echoPlayer = new MediaPlayer();
+                          echoPlayer.setDataSource(item.path);
+                          echoPlayer.prepare();
+                      }
+                      echoPlayer.setLooping(singleLoop);
+                      echoPlayer.setVolume(vol, vol);
+                      int targetPos = Math.max(0, mediaPlayer.getCurrentPosition() - delayMs);
+                      echoPlayer.seekTo(targetPos);
+                      if (!echoPlayer.isPlaying()) {
+                          echoPlayer.start();
+                      }
+                      if (Build.VERSION.SDK_INT >= 23) {
+                          PlaybackParams ep = echoPlayer.getPlaybackParams();
+                          ep.setSpeed(speed);
+                          ep.setPitch(pitch);
+                          echoPlayer.setPlaybackParams(ep);
+                      }
+                  } catch (Throwable ignored) {}
               }
-              void exportProject() {
-                  Intent i = new Intent(Intent.ACTION_SEND);
-                  i.setType("text/plain");
-                  i.putExtra(Intent.EXTRA_TEXT, editor.getText().toString());
-                  startActivity(Intent.createChooser(i, "Export Project"));
+
+              private PendingIntent createActionPendingIntent(int requestCode, String action) {
+                  Intent intent = new Intent(action);
+                  intent.setPackage(ctx.getPackageName());
+                  int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
+                  return PendingIntent.getBroadcast(ctx, requestCode, intent, flags);
               }
-              void showProperties() {
-                  LinearLayout l = new LinearLayout(this); l.setOrientation(LinearLayout.VERTICAL);
-                  EditText eName = new EditText(this); eName.setText(appName); eName.setHint("Name");
-                  EditText eVer = new EditText(this); eVer.setText(versionName); eVer.setHint("Version 1.0");
-                  EditText eCode = new EditText(this); eCode.setText(versionCode); eCode.setHint("Code 1");
-                  EditText eSdk = new EditText(this); eSdk.setText(sdkMin); eSdk.setHint("SDK 24");
-                  EditText eTarget = new EditText(this); eTarget.setText(sdkTarget); eTarget.setHint("Target 34");
-                  EditText ePkg = new EditText(this); ePkg.setText(packageName); ePkg.setHint("Package Name");
-                  EditText eAuthor = new EditText(this); eAuthor.setText(author); eAuthor.setHint("Author");
-                  Button permBtn = new Button(this); permBtn.setText("Change Permissions");
-                  permBtn.setOnClickListener(v -> showPermissions());
-                  l.addView(eName); l.addView(eVer); l.addView(eCode); l.addView(eSdk); l.addView(eTarget); l.addView(ePkg); l.addView(eAuthor); l.addView(permBtn);
-                  new AlertDialog.Builder(this).setTitle("Project Properties").setView(l)
-                      .setPositiveButton("Save", (d, w) -> {
-                          appName = eName.getText().toString();
-                          versionName = eVer.getText().toString();
-                          versionCode = eCode.getText().toString();
-                          sdkMin = eSdk.getText().toString();
-                          sdkTarget = eTarget.getText().toString();
-                          packageName = ePkg.getText().toString();
-                          author = eAuthor.getText().toString();
-                          projectNameView.setText("Project: " + appName);
-                          Toast.makeText(this, "Properties Saved!", Toast.LENGTH_SHORT).show();
-                      }).show();
+
+              private void updateNotification(AudioItem item, boolean isPlay) {
+                  try {
+                      NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+                      if (nm == null) return;
+                      Notification.Builder builder = (Build.VERSION.SDK_INT >= 26)
+                              ? new Notification.Builder(ctx, "audio_channel")
+                              : new Notification.Builder(ctx);
+
+                      PendingIntent piPrev = createActionPendingIntent(1, "JAHBAZ_ACTION_PREV");
+                      PendingIntent piRewind = createActionPendingIntent(5, "JAHBAZ_ACTION_REWIND");
+                      PendingIntent piPlay = createActionPendingIntent(2, "JAHBAZ_ACTION_PLAY");
+                      PendingIntent piForward = createActionPendingIntent(6, "JAHBAZ_ACTION_FORWARD");
+                      PendingIntent piNext = createActionPendingIntent(3, "JAHBAZ_ACTION_NEXT");
+                      PendingIntent piClose = createActionPendingIntent(4, "JAHBAZ_ACTION_CLOSE");
+
+                      String titleToDisplay = tagsPrefs.getString(item.path + "_title", item.name);
+
+                      builder.setContentTitle(titleToDisplay)
+                              .setContentText("MJ Audio Player")
+                              .setSmallIcon(android.R.drawable.ic_media_play)
+                              .setOngoing(isPlay)
+                              .setVisibility(Notification.VISIBILITY_PUBLIC)
+                              .addAction(android.R.drawable.ic_media_previous, "Prev", piPrev)
+                              .addAction(android.R.drawable.ic_media_rew, "Rewind", piRewind)
+                              .addAction(isPlay ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play,
+                                      isPlay ? "Pause" : "Play", piPlay)
+                              .addAction(android.R.drawable.ic_media_ff, "Forward", piForward)
+                              .addAction(android.R.drawable.ic_media_next, "Next", piNext)
+                              .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Close", piClose);
+
+                      try {
+                          Notification.MediaStyle style = new Notification.MediaStyle();
+                          style.setShowActionsInCompactView(1, 2, 3);
+                          if (Build.VERSION.SDK_INT >= 21) {
+                              if (mediaSession == null) {
+                                  mediaSession = new MediaSession(getApplicationContext(), "MJ_Audio_Session");
+                                  mediaSession.setActive(true);
+                              }
+                              style.setMediaSession(mediaSession.getSessionToken());
+
+                              PlaybackState.Builder stateBuilder = new PlaybackState.Builder();
+                              int state = isPlay ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED;
+                              long pos = 0;
+                              try {
+                                  pos = mediaPlayer.getCurrentPosition();
+                              } catch (Throwable ignored) {}
+                              stateBuilder.setState(state, pos, currentPlaybackSpeed);
+                              stateBuilder.setActions(
+                                      PlaybackState.ACTION_PLAY
+                                              | PlaybackState.ACTION_PAUSE
+                                              | PlaybackState.ACTION_SKIP_TO_NEXT
+                                              | PlaybackState.ACTION_SKIP_TO_PREVIOUS
+                                              | PlaybackState.ACTION_FAST_FORWARD
+                                              | PlaybackState.ACTION_REWIND
+                                              | PlaybackState.ACTION_STOP
+                              );
+                              mediaSession.setPlaybackState(stateBuilder.build());
+                          }
+                          builder.setStyle(style);
+                      } catch (Throwable ignored) {}
+
+                      nm.notify(111, builder.build());
+                  } catch (Throwable ignored) {}
               }
-              void showPermissions() {
-                  new AlertDialog.Builder(this).setTitle("Change Permissions")
-                      .setMultiChoiceItems(allPermissions, checkedPermissions, (d, which, isChecked) -> checkedPermissions[which] = isChecked)
-                      .setPositiveButton("OK / Save", (d, w) -> Toast.makeText(this, "Permissions Saved!", Toast.LENGTH_SHORT).show())
-                      .setNegativeButton("Cancel", null).show();
+
+              private void openLink(String url) {
+                  try {
+                      Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+                      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      ctx.startActivity(intent);
+                  } catch (Throwable ignored) {}
               }
-              void showAbout() {
-                  LinearLayout l = new LinearLayout(this); l.setOrientation(LinearLayout.VERTICAL);
-                  TextView t = new TextView(this);
-                  t.setText("APK Create\n\nIs app se aap apna JAVA code likh kar, permissions laga kar, Universal APK (32-bit + 64-bit) bana sakte hain.\n\nAndroid 7 se latest version tak sab mobiles par chalegi.\n\nSupport ke liye WhatsApp par rabta karein.");
-                  t.setPadding(20, 20, 20, 20);
-                  Button wa = new Button(this); wa.setText("WhatsApp - Support");
-                  wa.setOnClickListener(v -> {
-                      Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse("https://wa.me/923000000000"));
-                      startActivity(intent);
+
+              private String formatDuration(long ms) {
+                  if (ms <= 0) return "00:00";
+                  long totalSeconds = ms / 1000;
+                  long hrs = totalSeconds / 3600;
+                  long mins = (totalSeconds % 3600) / 60;
+                  long secs = totalSeconds % 60;
+                  if (hrs > 0) {
+                      return String.format(Locale.US, "%02d:%02d:%02d", hrs, mins, secs);
+                  } else {
+                      return String.format(Locale.US, "%02d:%02d", mins, secs);
+                  }
+              }
+
+              private String getBaseName(String path) {
+                  if (path == null) return "";
+                  int idx = path.lastIndexOf('/');
+                  return (idx >= 0 && idx < path.length() - 1) ? path.substring(idx + 1) : path;
+              }
+
+              private String getExtension(String path) {
+                  if (path == null) return "unknown";
+                  int idx = path.lastIndexOf('.');
+                  if (idx >= 0 && idx < path.length() - 1) {
+                      return path.substring(idx + 1);
+                  }
+                  return "unknown";
+              }
+
+              private void updateFolderTitle() {
+                  String title = currentFolderFilter;
+                  if ("ALL".equals(title)) {
+                      title = "All Audio Files";
+                  } else {
+                      title = getBaseName(title);
+                  }
+                  if (showFavoritesOnly) title = "Favorites";
+                  if (showRecentOnly) title = "Recent Playback";
+                  if (showTrashOnly) title = "Trash Bin";
+                  if (currentPlaylistFilter != null) title = "Playlist: " + currentPlaylistFilter;
+                  if (!currentSearchQuery.isEmpty()) {
+                      title = title + " (Searching: " + currentSearchQuery + ")";
+                  }
+                  currentFolderView.setText("Current: " + title + " (" + currentSortOrder + ")");
+              }
+
+              private void sortDisplayList() {
+                  String playingPath = null;
+                  if (currentIndex >= 0 && currentIndex < displayList.size()) {
+                      playingPath = displayList.get(currentIndex).path;
+                  }
+
+                  Comparator<AudioItem> comparator;
+                  if ("Title (Ascending)".equals(currentSortOrder) || "Name (A to Z)".equals(currentSortOrder)) {
+                      comparator = (a, b) -> a.name.toLowerCase(Locale.ROOT).compareTo(b.name.toLowerCase(Locale.ROOT));
+                  } else if ("Title (Descending)".equals(currentSortOrder) || "Name (Z to A)".equals(currentSortOrder)) {
+                      comparator = (a, b) -> b.name.toLowerCase(Locale.ROOT).compareTo(a.name.toLowerCase(Locale.ROOT));
+                  } else if ("Date (Newest First)".equals(currentSortOrder)) {
+                      comparator = (a, b) -> Long.compare(b.dateAdded, a.dateAdded);
+                  } else if ("Date (Oldest First)".equals(currentSortOrder)) {
+                      comparator = (a, b) -> Long.compare(a.dateAdded, b.dateAdded);
+                  } else if ("Size (Largest First)".equals(currentSortOrder)) {
+                      comparator = (a, b) -> Long.compare(b.size, a.size);
+                  } else if ("Size (Smallest First)".equals(currentSortOrder)) {
+                      comparator = (a, b) -> Long.compare(a.size, b.size);
+                  } else if ("Path (A to Z)".equals(currentSortOrder)) {
+                      comparator = (a, b) -> a.path.toLowerCase(Locale.ROOT).compareTo(b.path.toLowerCase(Locale.ROOT));
+                  } else {
+                      comparator = (a, b) -> Long.compare(b.dateAdded, a.dateAdded);
+                  }
+
+                  Collections.sort(displayList, comparator);
+
+                  if (playingPath != null) {
+                      for (int i = 0; i < displayList.size(); i++) {
+                          if (playingPath.equals(displayList.get(i).path)) {
+                              currentIndex = i;
+                              break;
+                          }
+                      }
+                  }
+              }
+
+              private boolean isFileInPlaylist(String path, String playlistName) {
+                  String listData = playlistsPrefs.getString(playlistName, "");
+                  return listData.contains(path);
+              }
+
+              private boolean isFileInTrash(String path) {
+                  return trashPrefs.getBoolean(path, false);
+              }
+
+              private void filterDisplayList() {
+                  displayList = new ArrayList<>();
+                  for (AudioItem file : audioList) {
+                      boolean inFolder = "ALL".equals(currentFolderFilter) || file.path.startsWith(currentFolderFilter);
+                      boolean isFav = favPrefs.getBoolean(file.path, false);
+                      boolean isRecent = recentPrefs.getBoolean(file.path, false);
+                      boolean inList = currentPlaylistFilter == null || isFileInPlaylist(file.path, currentPlaylistFilter);
+                      boolean inTrash = isFileInTrash(file.path);
+                      boolean matchSearch = currentSearchQuery.isEmpty()
+                              || file.name.toLowerCase(Locale.ROOT).contains(currentSearchQuery);
+
+                      if (showTrashOnly) {
+                          if (inTrash && matchSearch) displayList.add(file);
+                      } else if (!inTrash) {
+                          if (inFolder && (!showFavoritesOnly || isFav)
+                                  && (!showRecentOnly || isRecent)
+                                  && inList && matchSearch) {
+                              displayList.add(file);
+                          }
+                      }
+                  }
+                  sortDisplayList();
+              }
+
+              private void refreshListView() {
+                  filterDisplayList();
+                  renderDisplayList();
+              }
+
+              private void renderDisplayList() {
+                  fileCountView.setText("Total Audio: " + displayList.size());
+                  updateFolderTitle();
+                  List<String> stringList = new ArrayList<>();
+                  for (int i = 0; i < displayList.size(); i++) {
+                      AudioItem item = displayList.get(i);
+                      String titleToDisplay = tagsPrefs.getString(item.path + "_title", item.name);
+                      double sizeMB = item.size / (1024.0 * 1024.0);
+                      String durStr = formatDuration(item.duration);
+                      String fileType = getExtension(item.path).toUpperCase(Locale.ROOT);
+                      String advFields = String.format(Locale.US, "\n   [Size: %.1f MB | Time: %s | Type: %s]", sizeMB, durStr, fileType);
+                      stringList.add((i + 1) + ". " + titleToDisplay + advFields);
+                  }
+                  ArrayAdapter<String> adapter = new ArrayAdapter<>(ctx, android.R.layout.simple_list_item_1, stringList);
+                  listView.setAdapter(adapter);
+                  gridView.setAdapter(adapter);
+              }
+
+              private void showPlaylistsDialog() {
+                  String allPlaylistsStr = playlistsPrefs.getString("all_playlists", "");
+                  List<String> pList = new ArrayList<>();
+                  pList.add("Create New Playlist");
+                  for (String pName : allPlaylistsStr.split("\\|")) {
+                      if (!pName.isEmpty()) pList.add(pName);
+                  }
+
+                  new AlertDialog.Builder(ctx)
+                          .setTitle("Playlists")
+                          .setItems(pList.toArray(new String[0]), (dialog, which) -> {
+                              if (which == 0) {
+                                  EditText input = new EditText(ctx);
+                                  new AlertDialog.Builder(ctx)
+                                          .setTitle("New Playlist Name")
+                                          .setView(input)
+                                          .setPositiveButton("Create", (d, w) -> {
+                                              String newName = input.getText().toString();
+                                              if (!newName.isEmpty()) {
+                                                  String curr = playlistsPrefs.getString("all_playlists", "");
+                                                  playlistsPrefs.edit().putString("all_playlists", curr + newName + "|").apply();
+                                                  Toast.makeText(ctx, "Playlist Created!", Toast.LENGTH_SHORT).show();
+                                              }
+                                          })
+                                          .show();
+                              } else {
+                                  currentPlaylistFilter = pList.get(which);
+                                  showFavoritesOnly = false;
+                                  showRecentOnly = false;
+                                  showTrashOnly = false;
+                                  refreshListView();
+                              }
+                          })
+                          .show();
+              }
+
+              private void showGoToTimeDialog() {
+                  if (mediaPlayer == null) return;
+                  EditText input = new EditText(ctx);
+                  input.setHint("hh:mm:ss or mm:ss (e.g. 01:30:00 or 15:30)");
+                  new AlertDialog.Builder(ctx)
+                          .setTitle("Go To Time")
+                          .setView(input)
+                          .setPositiveButton("Go", (d, w) -> {
+                              String timeStr = input.getText().toString().trim();
+                              int millis = 0;
+                              Matcher m3 = Pattern.compile("(\\d+):(\\d+):(\\d+)").matcher(timeStr);
+                              if (m3.find()) {
+                                  int h = Integer.parseInt(m3.group(1));
+                                  int m = Integer.parseInt(m3.group(2));
+                                  int s = Integer.parseInt(m3.group(3));
+                                  millis = ((h * 3600) + (m * 60) + s) * 1000;
+                              } else {
+                                  Matcher m2 = Pattern.compile("(\\d+):(\\d+)").matcher(timeStr);
+                                  if (m2.find()) {
+                                      int m = Integer.parseInt(m2.group(1));
+                                      int s = Integer.parseInt(m2.group(2));
+                                      millis = ((m * 60) + s) * 1000;
+                                  }
+                              }
+
+                              if (millis > 0) {
+                                  try {
+                                      if (millis <= mediaPlayer.getDuration()) {
+                                          mediaPlayer.seekTo(millis);
+                                          seekBar.setProgress(millis);
+                                          timeCurrent.setText(formatDuration(millis));
+                                      } else {
+                                          Toast.makeText(ctx, "Time exceeds audio duration", Toast.LENGTH_SHORT).show();
+                                      }
+                                  } catch (Throwable ignored) {}
+                              } else {
+                                  Toast.makeText(ctx, "Invalid format. Use hh:mm:ss or mm:ss", Toast.LENGTH_SHORT).show();
+                              }
+                          })
+                          .setNegativeButton("Cancel", null)
+                          .show();
+              }
+
+              private void handleABRepeat() {
+                  if (mediaPlayer == null) return;
+                  try {
+                      if (abRepeatState == 0) {
+                          abPointA = mediaPlayer.getCurrentPosition();
+                          abRepeatState = 1;
+                          btnABRepeat.setText("A-B (A Set)");
+                          Toast.makeText(ctx, "Point A set", Toast.LENGTH_SHORT).show();
+                      } else if (abRepeatState == 1) {
+                          abPointB = mediaPlayer.getCurrentPosition();
+                          if (abPointB > abPointA) {
+                              abRepeatState = 2;
+                              btnABRepeat.setText("A-B (Active)");
+                              Toast.makeText(ctx, "Point B set. Repeating...", Toast.LENGTH_SHORT).show();
+                          } else {
+                              Toast.makeText(ctx, "Point B must be after A", Toast.LENGTH_SHORT).show();
+                              abRepeatState = 0;
+                              btnABRepeat.setText("A-B Repeat");
+                          }
+                      } else {
+                          abRepeatState = 0;
+                          btnABRepeat.setText("A-B Repeat");
+                          Toast.makeText(ctx, "A-B Repeat Cleared", Toast.LENGTH_SHORT).show();
+                      }
+                  } catch (Throwable ignored) {}
+              }
+
+              private void showSortDialog() {
+                  final String[] options = {
+                          "Title (Ascending)", "Title (Descending)",
+                          "Date (Newest First)", "Date (Oldest First)",
+                          "Size (Largest First)", "Size (Smallest First)",
+                          "Path (A to Z)"
+                  };
+                  new AlertDialog.Builder(ctx)
+                          .setTitle("Advanced Sort Fields")
+                          .setItems(options, (dialog, which) -> {
+                              currentSortOrder = options[which];
+                              prefs.edit().putString("sortOrder", currentSortOrder).apply();
+                              refreshListView();
+                              Toast.makeText(ctx, "Sorted by: " + currentSortOrder, Toast.LENGTH_SHORT).show();
+                          })
+                          .show();
+              }
+
+              private void showCustomEqDialog() {
+                  LinearLayout layout = new LinearLayout(ctx);
+                  layout.setOrientation(LinearLayout.VERTICAL);
+                  layout.setPadding(20, 20, 20, 20);
+
+                  final SeekBar[] seekBars = new SeekBar[5];
+                  for (int i = 0; i < 5; i++) {
+                      TextView label = new TextView(ctx);
+                      label.setText("Band " + (i + 1));
+                      layout.addView(label);
+                      SeekBar sb = new SeekBar(ctx);
+                      sb.setMax(3000);
+                      sb.setProgress(customEqBands[i] + 1500);
+                      layout.addView(sb);
+                      seekBars[i] = sb;
+                  }
+
+                  new AlertDialog.Builder(ctx)
+                          .setTitle("Custom Equalizer")
+                          .setView(layout)
+                          .setPositiveButton("Apply", (d, w) -> {
+                              SharedPreferences.Editor ed = prefs.edit();
+                              for (int i = 0; i < 5; i++) {
+                                  customEqBands[i] = seekBars[i].getProgress() - 1500;
+                                  ed.putInt("custEqBand" + (i + 1), customEqBands[i]);
+                              }
+                              ed.apply();
+                              currentVoiceEffect = "Custom";
+                              currentEqPreset = -1;
+                              if (isPlaying) applyVoiceAndSpeed();
+                              Toast.makeText(ctx, "Custom Equalizer Applied", Toast.LENGTH_SHORT).show();
+                          })
+                          .setNegativeButton("Cancel", null)
+                          .show();
+              }
+
+              private void applyVoiceAndSpeed() {
+                  try {
+                      if (Build.VERSION.SDK_INT >= 23 && mediaPlayer != null && mediaPlayer.isPlaying()) {
+                          int sessionId = mediaPlayer.getAudioSessionId();
+                          try { if (globalEq != null) globalEq.setEnabled(false); } catch (Throwable ignored) {}
+                          try { if (globalBass != null) globalBass.setEnabled(false); } catch (Throwable ignored) {}
+                          try { if (globalVirt != null) globalVirt.setEnabled(false); } catch (Throwable ignored) {}
+                          try { if (globalLoudness != null) globalLoudness.setEnabled(false); } catch (Throwable ignored) {}
+
+                          String e = currentVoiceEffect;
+                          float targetPitch = 1.0f;
+                          float speedMultiplier = 1.0f;
+                          int[] eqBands = null;
+                          int useBass = 0;
+                          int useVirt = 0;
+                          int echoDelay = 0;
+                          float echoVol = 0.0f;
+
+                          if ("Custom".equals(e)) { eqBands = customEqBands; }
+                          else if ("Baby".equals(e)) { targetPitch = 1.45f; eqBands = new int[]{-1000, -500, 500, 1200, 1500}; }
+                          else if ("Chipmunk".equals(e)) { targetPitch = 1.8f; eqBands = new int[]{-1500, 0, 800, 1500, 1500}; }
+                          else if ("Helium".equals(e)) { targetPitch = 1.95f; }
+                          else if ("Bee".equals(e)) { targetPitch = 2.1f; eqBands = new int[]{-1500, -1500, 1000, 1500, 1500}; }
+                          else if ("Female".equals(e)) { targetPitch = 1.35f; eqBands = new int[]{-1500, -600, 900, 1500, 1200}; }
+                          else if ("Male".equals(e)) { targetPitch = 0.80f; eqBands = new int[]{1200, 800, 0, -600, -1000}; }
+                          else if ("Deep / Monster".equals(e)) { targetPitch = 0.62f; useBass = 1000; eqBands = new int[]{1500, 1200, -500, -1200, -1500}; }
+                          else if ("Zombie".equals(e)) { targetPitch = 0.55f; speedMultiplier = 0.85f; eqBands = new int[]{1500, 800, -800, -1500, -1500}; }
+                          else if ("Alien".equals(e)) { targetPitch = 1.35f; useVirt = 1000; eqBands = new int[]{-1500, 1500, -1500, 1500, -1500}; }
+                          else if ("Robot".equals(e)) { targetPitch = 0.90f; useVirt = 1000; eqBands = new int[]{-1500, 1500, 1500, -1500, -1500}; }
+                          else if ("Telephone".equals(e)) { targetPitch = 1.06f; eqBands = new int[]{-1500, -1200, 1500, -1200, -1500}; }
+                          else if ("Old Radio".equals(e)) { targetPitch = 1.08f; speedMultiplier = 1.03f; eqBands = new int[]{-1500, 1200, 1500, -1000, -1500}; }
+                          else if ("Cave".equals(e)) { targetPitch = 0.88f; useVirt = 1000; useBass = 1000; eqBands = new int[]{1500, 1000, -400, -1000, -1500}; }
+                          else if ("Cathedral".equals(e)) { targetPitch = 0.94f; useVirt = 1000; useBass = 700; eqBands = new int[]{1200, 500, -500, 800, 1500}; }
+                          else if ("Grand Canyon".equals(e)) { targetPitch = 0.92f; useVirt = 1000; useBass = 800; eqBands = new int[]{1400, 400, -600, 600, 1400}; }
+                          else if ("Echo".equals(e)) { targetPitch = 1.0f; useVirt = 1000; eqBands = new int[]{600, 0, -400, 600, 1200}; echoDelay = 180; echoVol = 0.55f; }
+                          else if ("Bathroom".equals(e)) { targetPitch = 1.04f; useVirt = 1000; eqBands = new int[]{-1200, 1400, 1200, -800, -1200}; }
+                          else if ("Echo plus".equals(e)) { targetPitch = 0.96f; useVirt = 1000; useBass = 800; eqBands = new int[]{1200, 0, -500, 800, 1500}; echoDelay = 280; echoVol = 0.70f; }
+                          else if ("Bass Boost".equals(e)) { targetPitch = 0.86f; useBass = 1000; eqBands = new int[]{1500, 1500, 200, -1200, -1500}; }
+                          else if ("Treble Boost".equals(e)) { targetPitch = 1.15f; eqBands = new int[]{-1500, -1200, 400, 1500, 1500}; }
+                          else if ("Mid Boost".equals(e)) { targetPitch = 1.08f; eqBands = new int[]{-1500, 800, 1500, 800, -1500}; }
+                          else if ("Megaphone / BullHorn".equals(e)) { targetPitch = 1.14f; eqBands = new int[]{-1500, -1000, 1500, 1500, -1500}; }
+                          else if ("Underwater".equals(e)) { targetPitch = 0.82f; useBass = 1000; eqBands = new int[]{1500, 800, -1500, -1500, -1500}; }
+                          else if ("Dark Vader".equals(e)) { targetPitch = 0.68f; useBass = 800; useVirt = 800; eqBands = new int[]{1500, 1000, -500, -1000, -1500}; }
+                          else if ("Dragon".equals(e)) { targetPitch = 0.52f; useBass = 1000; eqBands = new int[]{1500, 1200, 0, -1200, -1500}; }
+                          else if ("Drunk".equals(e)) { targetPitch = 0.82f; speedMultiplier = 0.78f; }
+                          else if ("Shrinking".equals(e)) { targetPitch = 1.65f; speedMultiplier = 1.15f; }
+                          else if ("Battery Low".equals(e)) { targetPitch = 0.72f; speedMultiplier = 0.72f; }
+
+                          float finalSpeed = Math.max(0.25f, Math.min(3.0f, currentPlaybackSpeed * speedMultiplier));
+                          PlaybackParams params = mediaPlayer.getPlaybackParams();
+                          params.setSpeed(finalSpeed);
+                          params.setPitch(targetPitch);
+                          mediaPlayer.setPlaybackParams(params);
+
+                          if (eqBands != null) {
+                              try {
+                                  if (globalEq == null) globalEq = new Equalizer(0, sessionId);
+                                  globalEq.setEnabled(true);
+                                  short numBands = globalEq.getNumberOfBands();
+                                  for (short i = 0; i < numBands; i++) {
+                                      int idx = Math.min(eqBands.length - 1, i);
+                                      short lvl = (short) eqBands[idx];
+                                      try { globalEq.setBandLevel(i, lvl); } catch (Throwable ignored) {}
+                                  }
+                              } catch (Throwable ignored) {}
+                          } else if (currentEqPreset >= 0) {
+                              try {
+                                  if (globalEq == null) globalEq = new Equalizer(0, sessionId);
+                                  globalEq.setEnabled(true);
+                                  globalEq.usePreset((short) currentEqPreset);
+                              } catch (Throwable ignored) {}
+                          }
+
+                          if (useBass > 0) {
+                              try {
+                                  if (globalBass == null) globalBass = new BassBoost(0, sessionId);
+                                  globalBass.setEnabled(true);
+                                  globalBass.setStrength((short) useBass);
+                              } catch (Throwable ignored) {}
+                          }
+
+                          if (useVirt > 0) {
+                              try {
+                                  if (globalVirt == null) globalVirt = new Virtualizer(0, sessionId);
+                                  globalVirt.setEnabled(true);
+                                  globalVirt.setStrength((short) useVirt);
+                              } catch (Throwable ignored) {}
+                          }
+
+                          if (volumeBoostLevel > 0) {
+                              try {
+                                  if (globalLoudness == null) globalLoudness = new LoudnessEnhancer(sessionId);
+                                  globalLoudness.setTargetGain(volumeBoostLevel * 100);
+                                  globalLoudness.setEnabled(true);
+                              } catch (Throwable ignored) {}
+                          }
+
+                          syncEchoPlayer(echoDelay, echoVol, finalSpeed, targetPitch);
+                      }
+                  } catch (Throwable ignored) {}
+              }
+
+              private void scanAudioFiles() {
+                  fileCountView.setText("Loading Audio... Please Wait");
+                  new Thread(() -> {
+                      final List<AudioItem> tempAudioList = new ArrayList<>();
+                      try {
+                          ContentResolver resolver = ctx.getContentResolver();
+                          if (resolver != null) {
+                              Uri uri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI;
+                              String[] projection = {"_id", "_display_name", "_data", "date_added", "_size", "duration"};
+                              String sortOrder = "date_added DESC, date_modified DESC";
+                              Cursor cursor = resolver.query(uri, projection, null, null, sortOrder);
+                              if (cursor != null) {
+                                  int dataCol = cursor.getColumnIndex("_data");
+                                  int nameCol = cursor.getColumnIndex("_display_name");
+                                  int dateCol = cursor.getColumnIndex("date_added");
+                                  int sizeCol = cursor.getColumnIndex("_size");
+                                  int durCol = cursor.getColumnIndex("duration");
+
+                                  while (cursor.moveToNext()) {
+                                      if (dataCol >= 0) {
+                                          String path = cursor.getString(dataCol);
+                                          String name = (nameCol >= 0) ? cursor.getString(nameCol) : "Unknown";
+                                          if (name == null) name = "Unknown";
+                                          long dateAdded = (dateCol >= 0) ? cursor.getLong(dateCol) : 0;
+                                          long size = (sizeCol >= 0) ? cursor.getLong(sizeCol) : 0;
+                                          long duration = (durCol >= 0) ? cursor.getLong(durCol) : 0;
+
+                                          if (path != null && new File(path).exists()) {
+                                              tempAudioList.add(new AudioItem(name, path, dateAdded, size, duration));
+                                          }
+                                      }
+                                  }
+                                  cursor.close();
+                              }
+                          }
+                      } catch (Throwable ignored) {}
+
+                      runOnUiThread(() -> {
+                          audioList = tempAudioList;
+                          displayList = new ArrayList<>(audioList);
+                          refreshListView();
+
+                          String lastPath = prefs.getString("lastPlayingPath", "");
+                          int lastPos = prefs.getInt("pos_" + lastPath, 0);
+                          String lastName = prefs.getString("lastPlayingName", "");
+                          if (!lastPath.isEmpty()) {
+                              for (int idx = 0; idx < displayList.size(); idx++) {
+                                  if (lastPath.equals(displayList.get(idx).path)) {
+                                      currentIndex = idx;
+                                      break;
+                                  }
+                              }
+                              if (mediaPlayer != null && !mediaPlayer.isPlaying() && lastPos > 0) {
+                                  try {
+                                      mediaPlayer.reset();
+                                      mediaPlayer.setDataSource(lastPath);
+                                      mediaPlayer.prepare();
+                                      mediaPlayer.seekTo(lastPos);
+                                      btnSpeed.setText("Speed: " + currentPlaybackSpeed + "x");
+                                      trackStatusView.setText("Paused: " + (!lastName.isEmpty() ? lastName : "Unknown"));
+                                      seekBar.setMax(mediaPlayer.getDuration());
+                                      seekBar.setProgress(lastPos);
+                                      timeTotal.setText(formatDuration(mediaPlayer.getDuration()));
+                                      timeCurrent.setText(formatDuration(lastPos));
+                                  } catch (Throwable ignored) {}
+                              }
+                          }
+                      });
+                  }).start();
+              }
+
+              private void playAudioAtIndex(int index) {
+                  if (index < 0 || index >= displayList.size()) return;
+
+                  if (currentIndex >= 0 && currentIndex < displayList.size() && mediaPlayer != null) {
+                      try {
+                          if (isPlaying || mediaPlayer.getCurrentPosition() > 0) {
+                              prefs.edit().putInt("pos_" + displayList.get(currentIndex).path,
+                                      mediaPlayer.getCurrentPosition()).apply();
+                          }
+                      } catch (Throwable ignored) {}
+                  }
+
+                  if (index == currentIndex && mediaPlayer != null) {
+                      try {
+                          if (!mediaPlayer.isPlaying()) {
+                              mediaPlayer.start();
+                              applyVoiceAndSpeed();
+                              isPlaying = true;
+                              btnPlayPause.setText("Pause");
+                              updateNotification(displayList.get(currentIndex), true);
+                          }
+                      } catch (Throwable ignored) {}
+                      return;
+                  }
+
+                  currentIndex = index;
+                  AudioItem item = displayList.get(currentIndex);
+
+                  recentPrefs.edit().putBoolean(item.path, true).apply();
+                  btnSpeed.setText("Speed: " + currentPlaybackSpeed + "x");
+
+                  try {
+                      stopEchoPlayer();
+                      try { if (globalEq != null) { globalEq.release(); globalEq = null; } } catch (Throwable ignored) {}
+                      try { if (globalBass != null) { globalBass.release(); globalBass = null; } } catch (Throwable ignored) {}
+                      try { if (globalVirt != null) { globalVirt.release(); globalVirt = null; } } catch (Throwable ignored) {}
+                      try { if (globalLoudness != null) { globalLoudness.release(); globalLoudness = null; } } catch (Throwable ignored) {}
+
+                      mediaPlayer.reset();
+                      mediaPlayer.setDataSource(item.path);
+                      mediaPlayer.prepare();
+                      mediaPlayer.setLooping(singleLoop);
+
+                      int savedPos = prefs.getInt("pos_" + item.path, 0);
+                      if (savedPos > 0 && savedPos < (mediaPlayer.getDuration() - 2000)) {
+                          mediaPlayer.seekTo(savedPos);
+                      } else {
+                          savedPos = 0;
+                      }
+
+                      mediaPlayer.start();
+                      isPlaying = true;
+                      btnPlayPause.setText("Pause");
+                      String titleToDisplay = tagsPrefs.getString(item.path + "_title", item.name);
+                      trackStatusView.setText("Playing: " + titleToDisplay);
+                      seekBar.setMax(mediaPlayer.getDuration());
+                      seekBar.setProgress(savedPos);
+                      timeTotal.setText(formatDuration(mediaPlayer.getDuration()));
+                      timeCurrent.setText(formatDuration(savedPos));
+
+                      abRepeatState = 0;
+                      btnABRepeat.setText("A-B Repeat");
+
+                      prefs.edit()
+                              .putString("lastPlayingPath", item.path)
+                              .putString("lastPlayingName", titleToDisplay)
+                              .apply();
+                      updateNotification(item, true);
+                      applyVoiceAndSpeed();
+                  } catch (Throwable ignored) {}
+              }
+
+              private void playNextTrack() {
+                  if (displayList.isEmpty()) return;
+                  if (currentIndex >= 0 && currentIndex < displayList.size() - 1) {
+                      playAudioAtIndex(currentIndex + 1);
+                  } else {
+                      playAudioAtIndex(0);
+                  }
+              }
+
+              private void playPreviousTrack() {
+                  if (displayList.isEmpty()) return;
+                  if (currentIndex > 0) {
+                      playAudioAtIndex(currentIndex - 1);
+                  } else {
+                      playAudioAtIndex(0);
+                  }
+              }
+
+              private void togglePlayPause() {
+                  if (mediaPlayer == null) return;
+                  try {
+                      if (mediaPlayer.isPlaying()) {
+                          mediaPlayer.pause();
+                          try { if (echoPlayer != null && echoPlayer.isPlaying()) echoPlayer.pause(); } catch (Throwable ignored) {}
+                          isPlaying = false;
+                          btnPlayPause.setText("Play");
+                          if (currentIndex >= 0 && currentIndex < displayList.size()) {
+                              updateNotification(displayList.get(currentIndex), false);
+                              prefs.edit().putInt("pos_" + displayList.get(currentIndex).path,
+                                      mediaPlayer.getCurrentPosition()).apply();
+                          }
+                      } else {
+                          if (currentIndex == -1 && !displayList.isEmpty()) {
+                              playAudioAtIndex(0);
+                          } else {
+                              mediaPlayer.start();
+                              applyVoiceAndSpeed();
+                              isPlaying = true;
+                              btnPlayPause.setText("Pause");
+                              if (currentIndex >= 0 && currentIndex < displayList.size()) {
+                                  AudioItem item = displayList.get(currentIndex);
+                                  trackStatusView.setText("Playing: " + tagsPrefs.getString(item.path + "_title", item.name));
+                                  updateNotification(item, true);
+                              }
+                          }
+                      }
+                  } catch (Throwable ignored) {}
+              }
+
+              private void seekAndUpdate(int change) {
+                  try {
+                      if (mediaPlayer == null) return;
+                      int dur = mediaPlayer.getDuration();
+                      if (dur <= 0) return;
+                      int newPos = Math.max(0, Math.min(dur, mediaPlayer.getCurrentPosition() + change));
+                      mediaPlayer.seekTo(newPos);
+                      seekBar.setProgress(newPos);
+                      timeCurrent.setText(formatDuration(newPos));
+                      if (isPlaying) applyVoiceAndSpeed();
+                      if (currentIndex >= 0 && currentIndex < displayList.size()) {
+                          prefs.edit().putInt("pos_" + displayList.get(currentIndex).path, newPos).apply();
+                      }
+                  } catch (Throwable ignored) {}
+              }
+
+              // SD Card Detection (Android 10+ Compatible)
+              private String getSdCardPath() {
+                  String sdPath = null;
+                  try {
+                      File[] files = ctx.getExternalFilesDirs(null);
+                      if (files != null && files.length > 1) {
+                          Pattern p = Pattern.compile("^(/storage/[^/]+)");
+                          for (File f : files) {
+                              if (f != null) {
+                                  Matcher m = p.matcher(f.getAbsolutePath());
+                                  if (m.find()) {
+                                      String sdRoot = m.group(1);
+                                      if (sdRoot != null && !sdRoot.contains("emulated") && !sdRoot.contains("self")) {
+                                          File testDir = new File(sdRoot);
+                                          if (testDir.exists() && testDir.canRead()) {
+                                              sdPath = sdRoot;
+                                              break;
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  } catch (Throwable ignored) {}
+
+                  if (sdPath == null) {
+                      try {
+                          File storageDir = new File("/storage");
+                          if (storageDir.exists()) {
+                              File[] dirs = storageDir.listFiles();
+                              if (dirs != null) {
+                                  for (File d : dirs) {
+                                      String name = d.getName();
+                                      if (!"emulated".equals(name) && !"self".equals(name)
+                                              && d.isDirectory() && d.canRead()) {
+                                          sdPath = d.getAbsolutePath();
+                                          break;
+                                      }
+                                  }
+                              }
+                          }
+                      } catch (Throwable ignored) {}
+                  }
+                  return sdPath;
+              }
+
+              private boolean isAudioFileName(String name) {
+                  String lower = name.toLowerCase(Locale.ROOT);
+                  return lower.endsWith(".mp3") || lower.endsWith(".opus") || lower.endsWith(".m4a")
+                          || lower.endsWith(".wav") || lower.endsWith(".ogg") || lower.endsWith(".aac")
+                          || lower.endsWith(".amr");
+              }
+
+              private void showFileBrowser(String dirPath) {
+                  File f = new File(dirPath);
+                  if (!f.exists() || !f.isDirectory()) {
+                      Toast.makeText(ctx, "Folder not found or access denied", Toast.LENGTH_SHORT).show();
+                      return;
+                  }
+
+                  String rootInternal = Environment.getExternalStorageDirectory().getAbsolutePath();
+                  String sdPath = getSdCardPath();
+                  boolean isRoot = dirPath.equals(rootInternal) || (sdPath != null && dirPath.equals(sdPath));
+
+                  File[] files = null;
+                  try { files = f.listFiles(); } catch (Throwable ignored) {}
+
+                  List<BrowserItem> list = new ArrayList<>();
+                  if (files != null) {
+                      for (File file : Arrays.asList(files)) {
+                          String name = file.getName();
+                          if (!name.startsWith(".")) {
+                              list.add(new BrowserItem(name, file.getAbsolutePath(),
+                                      file.isDirectory(), false, file.lastModified()));
+                          }
+                      }
+                  }
+
+                  Comparator<BrowserItem> comp;
+                  if ("Title (Ascending)".equals(currentSortOrder) || "Name (A to Z)".equals(currentSortOrder)) {
+                      comp = (a, b) -> (a.isDir != b.isDir) ? (a.isDir ? -1 : 1)
+                              : a.name.toLowerCase(Locale.ROOT).compareTo(b.name.toLowerCase(Locale.ROOT));
+                  } else if ("Title (Descending)".equals(currentSortOrder) || "Name (Z to A)".equals(currentSortOrder)) {
+                      comp = (a, b) -> (a.isDir != b.isDir) ? (a.isDir ? -1 : 1)
+                              : b.name.toLowerCase(Locale.ROOT).compareTo(a.name.toLowerCase(Locale.ROOT));
+                  } else if ("Date (Oldest First)".equals(currentSortOrder)) {
+                      comp = (a, b) -> (a.isDir != b.isDir) ? (a.isDir ? -1 : 1)
+                              : Long.compare(a.dateAdded, b.dateAdded);
+                  } else {
+                      comp = (a, b) -> (a.isDir != b.isDir) ? (a.isDir ? -1 : 1)
+                              : Long.compare(b.dateAdded, a.dateAdded);
+                  }
+                  Collections.sort(list, comp);
+
+                  final List<String> finalNames = new ArrayList<>();
+                  final List<BrowserItem> finalList = new ArrayList<>();
+                  if (!isRoot) {
+                      finalNames.add("Go Back");
+                      finalList.add(new BrowserItem("Go Back", f.getParent(), false, true, 0));
+                  }
+                  for (BrowserItem v : list) {
+                      finalNames.add(v.name);
+                      finalList.add(v);
+                  }
+
+                  ListView lv = new ListView(ctx);
+                  lv.setAdapter(new ArrayAdapter<>(ctx, android.R.layout.simple_list_item_1, finalNames));
+
+                  AlertDialog.Builder builder = new AlertDialog.Builder(ctx);
+                  builder.setTitle("0".equals(f.getName()) ? "Internal Storage" : f.getName());
+                  builder.setView(lv);
+
+                  if (fileBrowserDialog != null) fileBrowserDialog.dismiss();
+                  fileBrowserDialog = builder.create();
+                  fileBrowserDialog.show();
+
+                  final File[] siblingFiles = files;
+                  lv.setOnItemClickListener((parent, view, position, id) -> {
+                      BrowserItem selected = finalList.get(position);
+                      if (selected.isGoBack) {
+                          if (selected.path != null && selected.path.length() >= 8) {
+                              showFileBrowser(selected.path);
+                          }
+                      } else if (selected.isDir) {
+                          showFileBrowser(selected.path);
+                      } else {
+                          if (isAudioFileName(selected.name)) {
+                              if (currentIndex >= 0 && currentIndex < displayList.size() && mediaPlayer != null) {
+                                  try {
+                                      prefs.edit().putInt("pos_" + displayList.get(currentIndex).path,
+                                              mediaPlayer.getCurrentPosition()).apply();
+                                  } catch (Throwable ignored) {}
+                              }
+                              List<AudioItem> siblings = new ArrayList<>();
+                              if (siblingFiles != null) {
+                                  for (File sibling : siblingFiles) {
+                                      if (!sibling.isDirectory() && isAudioFileName(sibling.getName())) {
+                                          siblings.add(new AudioItem(sibling.getName(), sibling.getAbsolutePath(),
+                                                  sibling.lastModified(), sibling.length(), 0));
+                                      }
+                                  }
+                              }
+                              Collections.sort(siblings, (a, b) ->
+                                      a.name.toLowerCase(Locale.ROOT).compareTo(b.name.toLowerCase(Locale.ROOT)));
+
+                              currentFolderFilter = f.getAbsolutePath();
+                              showFavoritesOnly = false;
+                              showRecentOnly = false;
+                              currentPlaylistFilter = null;
+                              showTrashOnly = false;
+                              currentIndex = -1;
+                              refreshListView();
+                              if (displayList.isEmpty()) {
+                                  displayList = siblings;
+                                  renderDisplayList();
+                              }
+
+                              int foundIdx = 0;
+                              for (int idx = 0; idx < displayList.size(); idx++) {
+                                  if (selected.path.equals(displayList.get(idx).path)) {
+                                      foundIdx = idx;
+                                      break;
+                                  }
+                              }
+                              playAudioAtIndex(foundIdx);
+                              if (fileBrowserDialog != null) fileBrowserDialog.dismiss();
+                          } else {
+                              Toast.makeText(ctx, "This is not an audio file", Toast.LENGTH_SHORT).show();
+                          }
+                      }
                   });
-                  l.addView(t); l.addView(wa);
-                  new AlertDialog.Builder(this).setTitle("About & Support").setView(l).setPositiveButton("OK", null).show();
+              }
+
+              private void showStorageSelectorDialog() {
+                  if (Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) {
+                      try {
+                          Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+                          intent.setData(Uri.parse("package:" + getPackageName()));
+                          startActivity(intent);
+                      } catch (Throwable ignored) {}
+                      return;
+                  }
+                  String internalPath = Environment.getExternalStorageDirectory().getAbsolutePath();
+                  String sdPath = getSdCardPath();
+                  final List<String> options = new ArrayList<>();
+                  final List<String> paths = new ArrayList<>();
+                  options.add("Internal storage");
+                  paths.add(internalPath);
+
+                  if (sdPath != null) {
+                      options.add("SD card");
+                      paths.add(sdPath);
+                  }
+
+                  new AlertDialog.Builder(ctx)
+                          .setTitle("Select Storage")
+                          .setItems(options.toArray(new String[0]), (dialog, which) -> showFileBrowser(paths.get(which)))
+                          .show();
+              }
+
+              private long[] getFolderWeight(String name) {
+                  Matcher mZeros = Pattern.compile("^(0+)").matcher(name);
+                  if (mZeros.find()) {
+                      return new long[]{1, mZeros.group(1).length()};
+                  }
+                  Matcher mNum = Pattern.compile("^([1-9]\\d*)").matcher(name);
+                  if (mNum.find()) {
+                      try {
+                          return new long[]{2, Long.parseLong(mNum.group(1))};
+                      } catch (Throwable ignored) {}
+                  }
+                  return new long[]{3, 0};
+              }
+
+              private void showFoldersDialog() {
+                  final Map<String, FolderInfo> foldersMap = new HashMap<>();
+                  for (AudioItem file : audioList) {
+                      String pathStr = file.path;
+                      int lastSlash = pathStr.lastIndexOf('/');
+                      if (lastSlash > 0) {
+                          String fPath = pathStr.substring(0, lastSlash);
+                          String fName = getBaseName(fPath);
+                          FolderInfo info = foldersMap.get(fPath);
+                          if (info == null) {
+                              info = new FolderInfo(fName, fPath, 0);
+                              foldersMap.put(fPath, info);
+                          }
+                          info.count++;
+                      }
+                  }
+
+                  List<String> sortedKeys = new ArrayList<>(foldersMap.keySet());
+                  Collections.sort(sortedKeys, (a, b) -> {
+                      int isPinnedA = pinnedPrefs.getBoolean(a, false) ? 1 : 0;
+                      int isPinnedB = pinnedPrefs.getBoolean(b, false) ? 1 : 0;
+                      if (isPinnedA != isPinnedB) return Integer.compare(isPinnedB, isPinnedA);
+
+                      String nameA = foldersMap.get(a).name.toLowerCase(Locale.ROOT);
+                      String nameB = foldersMap.get(b).name.toLowerCase(Locale.ROOT);
+                      long[] wA = getFolderWeight(nameA);
+                      long[] wB = getFolderWeight(nameB);
+                      if (wA[0] != wB[0]) return Long.compare(wA[0], wB[0]);
+                      if (wA[0] == 1 && wA[1] != wB[1]) return Long.compare(wB[1], wA[1]);
+                      if (wA[0] == 2 && wA[1] != wB[1]) return Long.compare(wA[1], wB[1]);
+                      return nameA.compareTo(nameB);
+                  });
+
+                  final List<String> folderPaths = new ArrayList<>();
+                  final List<String> folderNames = new ArrayList<>();
+                  folderPaths.add("ALL");
+                  folderNames.add("All Audio Files");
+                  for (String path : sortedKeys) {
+                      folderPaths.add(path);
+                      String prefix = pinnedPrefs.getBoolean(path, false) ? "📌 " : "";
+                      FolderInfo info = foldersMap.get(path);
+                      folderNames.add(prefix + info.name + " (" + info.count + ")");
+                  }
+
+                  AlertDialog.Builder builder = new AlertDialog.Builder(ctx);
+                  builder.setTitle("Select Folder");
+                  ListView flistView = new ListView(ctx);
+                  flistView.setAdapter(new ArrayAdapter<>(ctx, android.R.layout.simple_list_item_1, folderNames));
+                  builder.setView(flistView);
+
+                  final AlertDialog folderDialog = builder.create();
+
+                  flistView.setOnItemClickListener((parent, view, position, id) -> {
+                      if (currentIndex >= 0 && currentIndex < displayList.size() && mediaPlayer != null) {
+                          try {
+                              prefs.edit().putInt("pos_" + displayList.get(currentIndex).path,
+                                      mediaPlayer.getCurrentPosition()).apply();
+                          } catch (Throwable ignored) {}
+                      }
+                      currentFolderFilter = folderPaths.get(position);
+                      currentIndex = -1;
+                      showFavoritesOnly = false;
+                      showRecentOnly = false;
+                      currentPlaylistFilter = null;
+                      showTrashOnly = false;
+                      refreshListView();
+                      Toast.makeText(ctx, "Folder: " + folderNames.get(position), Toast.LENGTH_SHORT).show();
+                      folderDialog.dismiss();
+                  });
+
+                  flistView.setOnItemLongClickListener((parent, view, position, id) -> {
+                      if (position == 0) return true;
+                      final String path = folderPaths.get(position);
+                      final boolean isPinned = pinnedPrefs.getBoolean(path, false);
+                      String[] options = {isPinned ? "Unpin Folder" : "Pin Folder", "Rename Folder"};
+
+                      new AlertDialog.Builder(ctx)
+                              .setItems(options, (d, w) -> {
+                                  if (w == 0) {
+                                      if (isPinned) {
+                                          pinnedPrefs.edit().remove(path).apply();
+                                          Toast.makeText(ctx, "Unpinned", Toast.LENGTH_SHORT).show();
+                                      } else {
+                                          pinnedPrefs.edit().putBoolean(path, true).apply();
+                                          Toast.makeText(ctx, "Pinned to top", Toast.LENGTH_SHORT).show();
+                                      }
+                                      folderDialog.dismiss();
+                                      btnFolders.performClick();
+                                  } else if (w == 1) {
+                                      EditText renameInput = new EditText(ctx);
+                                      renameInput.setText(foldersMap.get(path).name);
+                                      new AlertDialog.Builder(ctx)
+                                              .setTitle("Rename Folder")
+                                              .setView(renameInput)
+                                              .setPositiveButton("Save", (d2, w2) -> {
+                                                  String newName = renameInput.getText().toString();
+                                                  if (!newName.isEmpty()) {
+                                                      File oldFile = new File(path);
+                                                      File newFile = new File(oldFile.getParent(), newName);
+                                                      if (oldFile.renameTo(newFile)) {
+                                                          rescanPath(oldFile.getAbsolutePath());
+                                                          rescanPath(newFile.getAbsolutePath());
+                                                          Toast.makeText(ctx, "Folder Renamed! Scanning...", Toast.LENGTH_SHORT).show();
+                                                          folderDialog.dismiss();
+                                                          scanAudioFiles();
+                                                      } else {
+                                                          Toast.makeText(ctx, "Rename failed. Storage permission required.", Toast.LENGTH_LONG).show();
+                                                      }
+                                                  }
+                                              })
+                                              .setNegativeButton("Cancel", null)
+                                              .show();
+                                  }
+                              })
+                              .show();
+                      return true;
+                  });
+
+                  folderDialog.show();
+              }
+
+              private void showVoiceEffectsDialog() {
+                  final String[] effectsList = {
+                          "Normal", "Baby", "Chipmunk", "Helium", "Bee", "Female", "Male",
+                          "Deep / Monster", "Zombie", "Alien", "Robot",
+                          "Telephone", "Old Radio", "Cave", "Cathedral", "Grand Canyon",
+                          "Echo", "Bathroom", "Echo plus", "Bass Boost", "Treble Boost",
+                          "Mid Boost", "Megaphone / BullHorn", "Underwater", "Dark Vader",
+                          "Dragon", "Drunk", "Shrinking", "Battery Low"
+                  };
+                  ListView lv = new ListView(ctx);
+                  lv.setAdapter(new ArrayAdapter<>(ctx, android.R.layout.simple_list_item_single_choice, effectsList));
+                  lv.setChoiceMode(ListView.CHOICE_MODE_SINGLE);
+                  for (int i = 0; i < effectsList.length; i++) {
+                      if (effectsList[i].equals(currentVoiceEffect)) {
+                          lv.setItemChecked(i, true);
+                          break;
+                      }
+                  }
+
+                  AlertDialog dialog = new AlertDialog.Builder(ctx)
+                          .setTitle("Select Voice Effect")
+                          .setView(lv)
+                          .setPositiveButton("Close (Back)", null)
+                          .create();
+                  dialog.show();
+
+                  lv.setOnItemClickListener((parent, view, position, id) -> {
+                      currentVoiceEffect = effectsList[position];
+                      currentEqPreset = -1;
+                      prefs.edit().putInt("eqPreset", -1).apply();
+                      if (isPlaying) applyVoiceAndSpeed();
+                      Toast.makeText(ctx, "Voice Applied: " + currentVoiceEffect, Toast.LENGTH_SHORT).show();
+                  });
+              }
+
+              private void showSpeedDialog() {
+                  final float[] speedOptions = {0.25f, 0.50f, 0.75f, 1.00f, 1.25f, 1.50f, 1.75f, 2.00f, 2.25f, 2.50f, 2.75f, 3.00f};
+                  final String[] speedNames = {
+                          "0.25x (Very Slow)", "0.50x (Slow)", "0.75x", "1.00x (Default)",
+                          "1.25x", "1.50x", "1.75x", "2.00x (Fast)",
+                          "2.25x", "2.50x", "2.75x", "3.00x (Very Fast)"
+                  };
+                  new AlertDialog.Builder(ctx)
+                          .setTitle("Select Global Audio Speed")
+                          .setItems(speedNames, (dialog, which) -> {
+                              currentPlaybackSpeed = speedOptions[which];
+                              prefs.edit().putFloat("playbackSpeed", currentPlaybackSpeed).apply();
+                              btnSpeed.setText("Speed: " + currentPlaybackSpeed + "x");
+                              if (mediaPlayer != null && isPlaying) applyVoiceAndSpeed();
+                              Toast.makeText(ctx, "Global Speed Set: " + currentPlaybackSpeed + "x", Toast.LENGTH_SHORT).show();
+                          })
+                          .show();
+              }
+
+              private boolean onAudioItemLongClick(int position) {
+                  if (position < 0 || position >= displayList.size()) return true;
+                  final AudioItem item = displayList.get(position);
+                  final boolean isFav = favPrefs.getBoolean(item.path, false);
+                  final boolean inTrash = isFileInTrash(item.path);
+
+                  final String[] options;
+                  if (inTrash) {
+                      options = new String[]{"Restore Audio", "Delete Permanently"};
+                  } else {
+                      options = new String[]{
+                              "File Info",
+                              isFav ? "Remove Favorite" : "Add to Favorites",
+                              "Share Audio",
+                              "Rename Audio",
+                              "Edit Tags (Title/Artist)",
+                              "Add to Playlist",
+                              "Delete Audio (To Trash)"
+                      };
+                  }
+
+                  new AlertDialog.Builder(ctx)
+                          .setTitle(tagsPrefs.getString(item.path + "_title", item.name))
+                          .setItems(options, (dialog, which) -> {
+                              if (inTrash) {
+                                  if (which == 0) {
+                                      trashPrefs.edit().remove(item.path).apply();
+                                      Toast.makeText(ctx, "Audio Restored", Toast.LENGTH_SHORT).show();
+                                      refreshListView();
+                                  } else if (which == 1) {
+                                      File f = new File(item.path);
+                                      if (f.delete()) {
+                                          rescanPath(item.path);
+                                          trashPrefs.edit().remove(item.path).apply();
+                                          Toast.makeText(ctx, "Deleted Permanently", Toast.LENGTH_SHORT).show();
+                                          scanAudioFiles();
+                                      } else {
+                                          Toast.makeText(ctx, "Failed to delete", Toast.LENGTH_SHORT).show();
+                                      }
+                                  }
+                              } else {
+                                  if (which == 0) { // Info
+                                      String ext = getExtension(item.path);
+                                      long durMs = item.duration;
+                                      MediaMetadataRetriever mmr = new MediaMetadataRetriever();
+                                      try {
+                                          mmr.setDataSource(item.path);
+                                          String durationStr = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION);
+                                          if (durationStr != null) durMs = Long.parseLong(durationStr);
+                                      } catch (Throwable ignored) {
+                                      } finally {
+                                          try { mmr.release(); } catch (Throwable ignored) {}
+                                      }
+                                      double sizeMB = item.size / (1024.0 * 1024.0);
+                                      String infoMsg = "Name: " + item.name
+                                              + "\n\nFormat: " + ext.toUpperCase(Locale.ROOT)
+                                              + "\n\nSize: " + String.format(Locale.US, "%.2f MB", sizeMB)
+                                              + "\n\nDuration: " + formatDuration(durMs);
+                                      new AlertDialog.Builder(ctx)
+                                              .setTitle("Audio Info")
+                                              .setMessage(infoMsg)
+                                              .setPositiveButton("OK", null)
+                                              .show();
+                                  } else if (which == 1) { // Favorite
+                                      if (isFav) {
+                                          favPrefs.edit().remove(item.path).apply();
+                                          Toast.makeText(ctx, "Removed from Favorites", Toast.LENGTH_SHORT).show();
+                                      } else {
+                                          favPrefs.edit().putBoolean(item.path, true).apply();
+                                          Toast.makeText(ctx, "Added to Favorites", Toast.LENGTH_SHORT).show();
+                                      }
+                                      if (showFavoritesOnly) refreshListView();
+                                  } else if (which == 2) { // Share
+                                      try {
+                                          StrictMode.VmPolicy.Builder builder = new StrictMode.VmPolicy.Builder();
+                                          StrictMode.setVmPolicy(builder.build());
+                                          Intent shareIntent = new Intent(Intent.ACTION_SEND);
+                                          shareIntent.setType("audio/*");
+                                          shareIntent.putExtra(Intent.EXTRA_STREAM, Uri.parse("file://" + item.path));
+                                          shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                                          ctx.startActivity(Intent.createChooser(shareIntent, "Share Audio via:"));
+                                      } catch (Throwable ignored) {}
+                                  } else if (which == 3) { // Rename
+                                      EditText renameInput = new EditText(ctx);
+                                      int dotIdx = item.name.lastIndexOf('.');
+                                      String baseName = (dotIdx > 0) ? item.name.substring(0, dotIdx) : item.name;
+                                      renameInput.setText(baseName);
+                                      new AlertDialog.Builder(ctx)
+                                              .setTitle("Rename Audio")
+                                              .setView(renameInput)
+                                              .setPositiveButton("Save", (d, w) -> {
+                                                  String newName = renameInput.getText().toString();
+                                                  if (!newName.isEmpty()) {
+                                                      int pDot = item.path.lastIndexOf('.');
+                                                      String ext = (pDot >= 0) ? item.path.substring(pDot) : "";
+                                                      File oldFile = new File(item.path);
+                                                      File newFile = new File(oldFile.getParent(), newName + ext);
+                                                      if (oldFile.renameTo(newFile)) {
+                                                          rescanPath(oldFile.getAbsolutePath());
+                                                          rescanPath(newFile.getAbsolutePath());
+                                                          Toast.makeText(ctx, "Audio Renamed!", Toast.LENGTH_SHORT).show();
+                                                          scanAudioFiles();
+                                                      } else {
+                                                          Toast.makeText(ctx, "Rename failed. Storage permission required.", Toast.LENGTH_LONG).show();
+                                                      }
+                                                  }
+                                              })
+                                              .setNegativeButton("Cancel", null)
+                                              .show();
+                                  } else if (which == 4) { // Edit Tags
+                                      EditText tagInput = new EditText(ctx);
+                                      tagInput.setText(tagsPrefs.getString(item.path + "_title", item.name));
+                                      new AlertDialog.Builder(ctx)
+                                              .setTitle("Edit Display Title")
+                                              .setView(tagInput)
+                                              .setPositiveButton("Save", (d, w) -> {
+                                                  String newTag = tagInput.getText().toString();
+                                                  if (!newTag.isEmpty()) {
+                                                      tagsPrefs.edit().putString(item.path + "_title", newTag).apply();
+                                                      Toast.makeText(ctx, "Title Updated", Toast.LENGTH_SHORT).show();
+                                                      refreshListView();
+                                                  }
+                                              })
+                                              .show();
+                                  } else if (which == 5) { // Add to Playlist
+                                      String allPlaylistsStr = playlistsPrefs.getString("all_playlists", "");
+                                      final List<String> pList = new ArrayList<>();
+                                      for (String pName : allPlaylistsStr.split("\\|")) {
+                                          if (!pName.isEmpty()) pList.add(pName);
+                                      }
+                                      if (pList.isEmpty()) {
+                                          Toast.makeText(ctx, "No playlists created yet. Create one first.", Toast.LENGTH_SHORT).show();
+                                      } else {
+                                          new AlertDialog.Builder(ctx)
+                                                  .setTitle("Select Playlist")
+                                                  .setItems(pList.toArray(new String[0]), (d, w) -> {
+                                                      String pName = pList.get(w);
+                                                      String currData = playlistsPrefs.getString(pName, "");
+                                                      if (!currData.contains(item.path)) {
+                                                          playlistsPrefs.edit().putString(pName, currData + item.path + "|").apply();
+                                                          Toast.makeText(ctx, "Added to " + pName, Toast.LENGTH_SHORT).show();
+                                                      } else {
+                                                          Toast.makeText(ctx, "Already in playlist", Toast.LENGTH_SHORT).show();
+                                                      }
+                                                  })
+                                                  .show();
+                                      }
+                                  } else if (which == 6) { // Move to Trash
+                                      trashPrefs.edit().putBoolean(item.path, true).apply();
+                                      Toast.makeText(ctx, "Moved to Trash Bin", Toast.LENGTH_SHORT).show();
+                                      refreshListView();
+                                  }
+                              }
+                          })
+                          .show();
+                  return true;
+              }
+
+              private void showEqPresets() {
+                  try {
+                      if (globalEq == null) globalEq = new Equalizer(0, mediaPlayer.getAudioSessionId());
+                      short numPresets = globalEq.getNumberOfPresets();
+                      final String[] presetNames = new String[numPresets];
+                      for (short i = 0; i < numPresets; i++) {
+                          presetNames[i] = globalEq.getPresetName(i);
+                      }
+
+                      new AlertDialog.Builder(ctx)
+                              .setTitle("EQ Presets")
+                              .setItems(presetNames, (dialog, which) -> {
+                                  currentEqPreset = which;
+                                  currentVoiceEffect = "Normal";
+                                  prefs.edit().putInt("eqPreset", currentEqPreset).apply();
+                                  if (isPlaying) applyVoiceAndSpeed();
+                                  Toast.makeText(ctx, "Preset Applied: " + presetNames[which], Toast.LENGTH_SHORT).show();
+                              })
+                              .show();
+                  } catch (Throwable ignored) {}
+              }
+
+              private void showSuccessDialog(final AlertDialog parentDialog) {
+                  LinearLayout layout = new LinearLayout(ctx);
+                  layout.setOrientation(LinearLayout.VERTICAL);
+                  layout.setPadding(60, 60, 60, 60);
+                  layout.setGravity(Gravity.CENTER);
+
+                  TextView msgText = new TextView(ctx);
+                  msgText.setText("Feedback sent successfully!");
+                  msgText.setTextSize(18);
+                  msgText.setTextColor(0xFF4CAF50);
+                  msgText.setGravity(Gravity.CENTER);
+                  msgText.setPadding(0, 0, 0, 40);
+                  layout.addView(msgText);
+
+                  Button btnOk = new Button(ctx);
+                  btnOk.setText("OK");
+                  btnOk.setBackgroundColor(0xFF2196F3);
+                  btnOk.setTextColor(0xFFFFFFFF);
+                  btnOk.setLayoutParams(new LinearLayout.LayoutParams(-1, -2));
+                  layout.addView(btnOk);
+
+                  final AlertDialog successDialog = new AlertDialog.Builder(ctx).setView(layout).create();
+                  successDialog.show();
+                  btnOk.setOnClickListener(v -> {
+                      successDialog.dismiss();
+                      if (parentDialog != null) parentDialog.dismiss();
+                  });
+              }
+
+              private void openFeedbackDialog() {
+                  ScrollView scroll = new ScrollView(ctx);
+                  LinearLayout layout = new LinearLayout(ctx);
+                  layout.setOrientation(LinearLayout.VERTICAL);
+                  layout.setPadding(40, 40, 40, 40);
+
+                  TextView title = new TextView(ctx);
+                  title.setText("Send Feedback to Developer:");
+                  title.setTextSize(20);
+                  title.setGravity(Gravity.CENTER);
+                  title.setTextColor(0xFF2196F3);
+                  title.setPadding(0, 0, 0, 20);
+                  layout.addView(title);
+
+                  EditText editAppName = new EditText(ctx);
+                  editAppName.setText("App: MJ Audio Player");
+                  editAppName.setEnabled(false);
+                  editAppName.setTextColor(0xFF888888);
+                  layout.addView(editAppName);
+
+                  final EditText editName = new EditText(ctx);
+                  editName.setHint("Enter Name");
+                  layout.addView(editName);
+
+                  final EditText editWa = new EditText(ctx);
+                  editWa.setHint("WhatsApp Number (Optional)");
+                  editWa.setInputType(InputType.TYPE_CLASS_PHONE);
+                  layout.addView(editWa);
+
+                  final EditText editMsg = new EditText(ctx);
+                  editMsg.setHint("Enter Feedback Message");
+                  layout.addView(editMsg);
+
+                  Button btnSend = new Button(ctx);
+                  btnSend.setText("SEND FEEDBACK");
+                  btnSend.setBackgroundColor(0xFF2196F3);
+                  btnSend.setTextColor(0xFFFFFFFF);
+                  LinearLayout.LayoutParams pSend = new LinearLayout.LayoutParams(-1, -2);
+                  pSend.topMargin = 15;
+                  btnSend.setLayoutParams(pSend);
+                  layout.addView(btnSend);
+
+                  Button btnBack = new Button(ctx);
+                  btnBack.setText("GO BACK");
+                  btnBack.setBackgroundColor(0xFFF44336);
+                  btnBack.setTextColor(0xFFFFFFFF);
+                  LinearLayout.LayoutParams pBack = new LinearLayout.LayoutParams(-1, -2);
+                  pBack.topMargin = 10;
+                  btnBack.setLayoutParams(pBack);
+                  layout.addView(btnBack);
+
+                  scroll.addView(layout);
+                  final AlertDialog mainDialog = new AlertDialog.Builder(ctx).setView(scroll).create();
+                  mainDialog.show();
+
+                  btnBack.setOnClickListener(v -> mainDialog.dismiss());
+
+                  btnSend.setOnClickListener(v -> {
+                      final String name = editName.getText().toString();
+                      final String wa = editWa.getText().toString();
+                      final String msg = editMsg.getText().toString();
+                      if (msg.isEmpty()) {
+                          Toast.makeText(ctx, "Please enter feedback message", Toast.LENGTH_SHORT).show();
+                          return;
+                      }
+                      if (msg.length() > 5000) {
+                          Toast.makeText(ctx, "Feedback message exceeds 5000 characters limit", Toast.LENGTH_SHORT).show();
+                          return;
+                      }
+
+                      final ProgressDialog pd = new ProgressDialog(ctx);
+                      pd.setMessage("Sending please wait...");
+                      pd.setCancelable(false);
+                      pd.show();
+
+                      new Thread(() -> {
+                          int responseCode = -1;
+                          try {
+                              String BOT_TOKEN = "8779947243:AAEC3HYql5KbbJnJZTe7YYB2rIQK-xoJab8";
+                              String CHAT_ID = "7390973466";
+                              String VERCEL_URL = "https://send-feedback-dusky.vercel.app/api";
+
+                              StringBuilder fullText = new StringBuilder();
+                              fullText.append("New Feedback Received:\nApp: MJ Audio Player\nName: ")
+                                      .append(!name.isEmpty() ? name : "Anonymous");
+                              if (!wa.isEmpty()) {
+                                  fullText.append("\nWhatsApp: ").append(wa);
+                              }
+                              fullText.append("\nFeedback: ").append(msg);
+
+                              String postData = "bot_token=" + URLEncoder.encode(BOT_TOKEN, "UTF-8")
+                                      + "&chat_id=" + URLEncoder.encode(CHAT_ID, "UTF-8")
+                                      + "&text=" + URLEncoder.encode(fullText.toString(), "UTF-8");
+
+                              URL url = new URL(VERCEL_URL);
+                              HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                              conn.setRequestMethod("POST");
+                              conn.setDoOutput(true);
+                              conn.setConnectTimeout(15000);
+                              conn.setReadTimeout(15000);
+                              conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
+
+                              byte[] outBytes = postData.getBytes(StandardCharsets.UTF_8);
+                              try (OutputStream os = conn.getOutputStream()) {
+                                  os.write(outBytes);
+                              }
+                              responseCode = conn.getResponseCode();
+                              conn.disconnect();
+                          } catch (Throwable ignored) {}
+
+                          final int finalCode = responseCode;
+                          runOnUiThread(() -> {
+                              try { pd.dismiss(); } catch (Throwable ignored) {}
+                              if (finalCode == 200) {
+                                  Toast.makeText(ctx, "Feedback sent successfully", Toast.LENGTH_SHORT).show();
+                                  editMsg.setText("");
+                                  showSuccessDialog(mainDialog);
+                              } else {
+                                  Toast.makeText(ctx, "Failed to send. Error: " + (finalCode > 0 ? finalCode : "Unknown"), Toast.LENGTH_LONG).show();
+                              }
+                          });
+                      }).start();
+                  });
+              }
+
+              private String getSkipText() {
+                  if (skipDuration == 300000) return "Skip Time: 5 minutes";
+                  else if (skipDuration == 120000) return "Skip Time: 2 minutes";
+                  else if (skipDuration == 60000) return "Skip Time: 1 minute";
+                  else return "Skip Time: " + (skipDuration / 1000) + " seconds";
+              }
+
+              private void showSettingsDialog() {
+                  AlertDialog.Builder settingsDialog = new AlertDialog.Builder(ctx);
+                  settingsDialog.setTitle("Settings");
+                  ScrollView layout = new ScrollView(ctx);
+                  LinearLayout innerLayout = new LinearLayout(ctx);
+                  innerLayout.setOrientation(LinearLayout.VERTICAL);
+                  innerLayout.setPadding(30, 20, 30, 20);
+                  layout.addView(innerLayout);
+
+                  Button btnSleep = new Button(ctx);
+                  btnSleep.setText("Sleep Timer");
+                  btnSleep.setOnClickListener(v -> {
+                      final String[] options = {"Turn Off", "15 Minutes", "30 Minutes", "1 Hour", "2 Hours", "3 Hours"};
+                      final int[] values = {0, 15, 30, 60, 120, 180};
+                      new AlertDialog.Builder(ctx)
+                              .setTitle("Set Sleep Timer")
+                              .setItems(options, (d, w) -> {
+                                  int mins = values[w];
+                                  if (sleepTimerRunnable != null) {
+                                      sleepTimerHandler.removeCallbacks(sleepTimerRunnable);
+                                      sleepTimerRunnable = null;
+                                  }
+                                  if (mins > 0) {
+                                      sleepTimerRunnable = () -> {
+                                          if (isPlaying && mediaPlayer != null) {
+                                              btnPlayPause.performClick();
+                                              Toast.makeText(ctx, "Sleep Timer: Audio Paused", Toast.LENGTH_LONG).show();
+                                          }
+                                      };
+                                      sleepTimerHandler.postDelayed(sleepTimerRunnable, mins * 60000L);
+                                      Toast.makeText(ctx, "Timer set for " + mins + " minutes", Toast.LENGTH_SHORT).show();
+                                  } else {
+                                      Toast.makeText(ctx, "Sleep Timer turned OFF", Toast.LENGTH_SHORT).show();
+                                  }
+                              })
+                              .show();
+                  });
+                  innerLayout.addView(btnSleep);
+
+                  Button btnTrash = new Button(ctx);
+                  btnTrash.setText("Trash Bin");
+                  btnTrash.setOnClickListener(v -> {
+                      showTrashOnly = !showTrashOnly;
+                      if (showTrashOnly) {
+                          showFavoritesOnly = false;
+                          showRecentOnly = false;
+                          currentPlaylistFilter = null;
+                          Toast.makeText(ctx, "Showing Trash Bin", Toast.LENGTH_SHORT).show();
+                      } else {
+                          Toast.makeText(ctx, "Showing All Files", Toast.LENGTH_SHORT).show();
+                      }
+                      refreshListView();
+                  });
+                  innerLayout.addView(btnTrash);
+
+                  Button btnEqPresets = new Button(ctx);
+                  btnEqPresets.setText("EQ Presets");
+                  btnEqPresets.setOnClickListener(v -> showEqPresets());
+                  innerLayout.addView(btnEqPresets);
+
+                  Button btnVolumeBoost = new Button(ctx);
+                  btnVolumeBoost.setText("Volume Boost");
+                  btnVolumeBoost.setOnClickListener(v -> {
+                      final String[] options = {"Normal (Off)", "Boost 50%", "Boost 100%", "Boost 150%"};
+                      final int[] values = {0, 5, 10, 15};
+                      new AlertDialog.Builder(ctx)
+                              .setTitle("Volume Boost")
+                              .setItems(options, (d, w) -> {
+                                  volumeBoostLevel = values[w];
+                                  prefs.edit().putInt("volBoost", volumeBoostLevel).apply();
+                                  if (isPlaying) applyVoiceAndSpeed();
+                                  Toast.makeText(ctx, "Volume Boost: " + options[w], Toast.LENGTH_SHORT).show();
+                              })
+                              .show();
+                  });
+                  innerLayout.addView(btnVolumeBoost);
+
+                  final Button btnSkipTime = new Button(ctx);
+                  btnSkipTime.setText(getSkipText());
+                  btnSkipTime.setOnClickListener(v -> {
+                      if (skipDuration == 5000) skipDuration = 10000;
+                      else if (skipDuration == 10000) skipDuration = 20000;
+                      else if (skipDuration == 20000) skipDuration = 30000;
+                      else if (skipDuration == 30000) skipDuration = 60000;
+                      else if (skipDuration == 60000) skipDuration = 120000;
+                      else if (skipDuration == 120000) skipDuration = 300000;
+                      else if (skipDuration == 300000) skipDuration = 5000;
+                      else skipDuration = 10000;
+                      btnSkipTime.setText(getSkipText());
+                      prefs.edit().putInt("skipDuration", skipDuration).apply();
+                      String msg;
+                      if (skipDuration == 300000) msg = "Saved 5 minutes";
+                      else if (skipDuration == 60000) msg = "Saved 1 minute";
+                      else if (skipDuration == 120000) msg = "Saved 2 minutes";
+                      else msg = "Saved " + (skipDuration / 1000) + " seconds";
+                      Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show();
+                  });
+                  innerLayout.addView(btnSkipTime);
+
+                  final CheckBox chkSingleLoop = new CheckBox(ctx);
+                  chkSingleLoop.setText("Repeat Current Track");
+                  chkSingleLoop.setChecked(singleLoop);
+                  chkSingleLoop.setPadding(0, 10, 0, 15);
+                  chkSingleLoop.setOnClickListener(v -> {
+                      singleLoop = chkSingleLoop.isChecked();
+                      try { mediaPlayer.setLooping(singleLoop); } catch (Throwable ignored) {}
+                      prefs.edit().putBoolean("singleLoop", singleLoop).apply();
+                      Toast.makeText(ctx, "Repeat settings auto-saved", Toast.LENGTH_SHORT).show();
+                  });
+                  innerLayout.addView(chkSingleLoop);
+
+                  Button btnContact = new Button(ctx);
+                  btnContact.setText("Contact Developer on WhatsApp");
+                  btnContact.setOnClickListener(v -> openLink("https://wa.me/923041011727"));
+                  innerLayout.addView(btnContact);
+
+                  Button btnChannel = new Button(ctx);
+                  btnChannel.setText("Join WhatsApp Channel");
+                  btnChannel.setOnClickListener(v -> openLink("https://whatsapp.com/channel/0029Vb5y8QCEwEk1OkHev10x"));
+                  innerLayout.addView(btnChannel);
+
+                  Button btnFeedback = new Button(ctx);
+                  btnFeedback.setText("Send Feedback");
+                  btnFeedback.setOnClickListener(v -> openFeedbackDialog());
+                  innerLayout.addView(btnFeedback);
+
+                  Button btnAbout = new Button(ctx);
+                  btnAbout.setText("About & Support");
+                  btnAbout.setOnClickListener(v -> new AlertDialog.Builder(ctx)
+                          .setTitle("About & Support")
+                          .setMessage("App Name: MJ Audio Player\nDeveloper: Jahbaz hijbani\n\nFeatures:\n- Audio Speed & 28 Voice FX\n- Smart Folder System\n- Background Play")
+                          .setPositiveButton("OK", null)
+                          .show());
+                  innerLayout.addView(btnAbout);
+
+                  settingsDialog.setView(layout);
+                  settingsDialog.setNegativeButton("Close", null);
+                  settingsDialog.show();
               }
           }
           EOF
-          echo '<?xml version="1.0" encoding="utf-8"?><LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="match_parent"></LinearLayout>' > app/src/main/res/layout/activity_main.xml
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.5'
 
       - name: Build APK
-        uses: gradle/gradle-build-action@v2
-        with:
-          arguments: assembleDebug
-          gradle-version: '8.5'
+        run: gradle assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: apk-create-apk
+          name: mj-audio-player-apk
           path: app/build/outputs/apk/debug/app-debug.apk

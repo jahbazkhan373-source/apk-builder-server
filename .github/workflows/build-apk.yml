@@ -1,0 +1,77 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Make Sample App
+        run: |
+          mkdir -p app/src/main/java/com/example/app
+          mkdir -p app/src/main/res/layout
+          echo "include ':app'" > settings.gradle
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.2.2' }
+          android {
+            namespace 'com.example.app'
+            compileSdk 34
+            defaultConfig {
+              applicationId 'com.example.app'
+              minSdk 24
+              targetSdk 34
+              versionCode 1
+              versionName '1.0'
+            }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:label="My App">
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/example/app/MainActivity.java <<'EOF'
+          package com.example.app;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.widget.TextView;
+          public class MainActivity extends Activity {
+            protected void onCreate(Bundle b) {
+              super.onCreate(b);
+              TextView t = new TextView(this);
+              t.setText("Hello, APK Builder Server is Working!");
+              setContentView(t);
+            }
+          }
+          EOF
+          echo '<?xml version="1.0" encoding="utf-8"?><LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="match_parent"></LinearLayout>' > app/src/main/res/layout/activity_main.xml
+
+      - name: Build APK
+        uses: gradle/gradle-build-action@v2
+        with:
+          arguments: assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: my-app-apk
+          path: app/build/outputs/apk/debug/app-debug.apk

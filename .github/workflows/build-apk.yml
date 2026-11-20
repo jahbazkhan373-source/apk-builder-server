@@ -1,9 +1,12 @@
-name: Build MJ Audio Player APK
+name: Build & Release MJ Audio Player APK
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -64,9 +67,22 @@ jobs:
               sourceCompatibility JavaVersion.VERSION_17
               targetCompatibility JavaVersion.VERSION_17
             }
+            signingConfigs {
+              release {
+                storeFile file("release.keystore")
+                storePassword System.getenv("KEYSTORE_PASSWORD") ?: "MJAud1oReleaseKey2026"
+                keyAlias System.getenv("KEY_ALIAS") ?: "mj_audio_key"
+                keyPassword System.getenv("KEY_PASSWORD") ?: "MJAud1oReleaseKey2026"
+              }
+            }
             buildTypes {
               debug {
                 minifyEnabled false
+              }
+              release {
+                signingConfig signingConfigs.release
+                minifyEnabled false
+                debuggable false
               }
             }
           }
@@ -2492,16 +2508,63 @@ jobs:
           }
           EOF
 
+      - name: Prepare Release Keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > app/release.keystore
+            echo "Permanent keystore loaded from GitHub Secrets."
+          else
+            STORE_PASS="${KEYSTORE_PASSWORD:-MJAud1oReleaseKey2026}"
+            ALIAS_NAME="${KEY_ALIAS:-mj_audio_key}"
+            KEY_PASS="${KEY_PASSWORD:-MJAud1oReleaseKey2026}"
+            keytool -genkeypair -v \
+              -keystore app/release.keystore \
+              -alias "$ALIAS_NAME" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass "$STORE_PASS" \
+              -keypass "$KEY_PASS" \
+              -dname "CN=MJ Audio Player, OU=Mobile, O=Jahbaz Hijbani, L=DG Khan, ST=Punjab, C=PK"
+            echo "Auto-generated release keystore created for this build."
+          fi
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.5'
 
-      - name: Build APK
-        run: gradle assembleDebug
+      - name: Build Signed Release APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          gradle assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk MJ-Audio-Player-v1.0.apk
 
-      - name: Upload APK
+      - name: Upload Release APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mj-audio-player-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: mj-audio-player-release-apk
+          path: MJ-Audio-Player-v1.0.apk
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0-build-${{ github.run_number }}
+          name: MJ Audio Player v1.0 (Build ${{ github.run_number }})
+          body: |
+            ### MJ Audio Player v1.0 (Signed Release APK)
+            - **Developer:** Jahbaz Hijbani
+            - **Package:** `com.mjaudio.player`
+            - **Compatibility:** Android 7.0 (API 24) to Android 14+ (API 34) — Universal 32-bit & 64-bit
+            - **Signed:** Release Certificate (`debuggable = false`)
+          files: MJ-Audio-Player-v1.0.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

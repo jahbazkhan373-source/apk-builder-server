@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  APP_VERSION_NAME: '1.1'
+  APP_VERSION_NAME: '1.2'
 
 jobs:
   build:
@@ -99,6 +99,76 @@ jobs:
           java -Djava.awt.headless=true GenerateIcon.java
           rm -f GenerateIcon.java
 
+      - name: Generate Hidden Feedback Config
+        env:
+          FB_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          FB_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FB_URL: ${{ secrets.FEEDBACK_API_URL }}
+        run: |
+          mkdir -p app/src/main/java/com/mjaudio/player
+          cat > GenFeedbackConfig.java <<'EOF'
+          import java.io.FileOutputStream;
+          import java.nio.charset.StandardCharsets;
+          import java.security.SecureRandom;
+
+          public class GenFeedbackConfig {
+              private static String encode(String input, byte[] mask) {
+                  if (input == null || input.trim().isEmpty()) return "new byte[0]";
+                  byte[] data = input.trim().getBytes(StandardCharsets.UTF_8);
+                  StringBuilder sb = new StringBuilder("new byte[]{");
+                  for (int i = 0; i < data.length; i++) {
+                      if (i > 0) sb.append(",");
+                      sb.append((byte) (data[i] ^ mask[i % mask.length]));
+                  }
+                  sb.append("}");
+                  return sb.toString();
+              }
+
+              private static String raw(byte[] data) {
+                  StringBuilder sb = new StringBuilder("new byte[]{");
+                  for (int i = 0; i < data.length; i++) {
+                      if (i > 0) sb.append(",");
+                      sb.append(data[i]);
+                  }
+                  sb.append("}");
+                  return sb.toString();
+              }
+
+              public static void main(String[] args) throws Exception {
+                  byte[] mask = new byte[24];
+                  new SecureRandom().nextBytes(mask);
+                  String t = System.getenv("FB_TOKEN");
+                  String c = System.getenv("FB_CHAT");
+                  String u = System.getenv("FB_URL");
+
+                  String src =
+                          "package com.mjaudio.player;\n" +
+                          "import java.nio.charset.StandardCharsets;\n" +
+                          "public class FeedbackConfig {\n" +
+                          "    private static final byte[] K = " + raw(mask) + ";\n" +
+                          "    private static final byte[] A = " + encode(t, mask) + ";\n" +
+                          "    private static final byte[] B = " + encode(c, mask) + ";\n" +
+                          "    private static final byte[] C = " + encode(u, mask) + ";\n" +
+                          "    private static String d(byte[] s) {\n" +
+                          "        if (s == null || s.length == 0) return \"\";\n" +
+                          "        byte[] o = new byte[s.length];\n" +
+                          "        for (int i = 0; i < s.length; i++) o[i] = (byte) (s[i] ^ K[i % K.length]);\n" +
+                          "        return new String(o, StandardCharsets.UTF_8);\n" +
+                          "    }\n" +
+                          "    public static String getA() { return d(A); }\n" +
+                          "    public static String getB() { return d(B); }\n" +
+                          "    public static String getC() { return d(C); }\n" +
+                          "}\n";
+
+                  try (FileOutputStream fos = new FileOutputStream("app/src/main/java/com/mjaudio/player/FeedbackConfig.java")) {
+                      fos.write(src.getBytes(StandardCharsets.UTF_8));
+                  }
+              }
+          }
+          EOF
+          java GenFeedbackConfig.java
+          rm -f GenFeedbackConfig.java
+
       - name: Create MJ Audio Player Project
         run: |
           mkdir -p app/src/main/java/com/mjaudio/player
@@ -139,7 +209,7 @@ jobs:
               minSdk 24
               targetSdk 34
               versionCode (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInteger()
-              versionName (System.getenv("APP_VERSION_NAME") ?: "1.1")
+              versionName (System.getenv("APP_VERSION_NAME") ?: "1.2")
             }
             compileOptions {
               sourceCompatibility JavaVersion.VERSION_17
@@ -223,6 +293,10 @@ jobs:
                 android:name=".MediaPlaybackService"
                 android:exported="false"
                 android:foregroundServiceType="mediaPlayback" />
+
+              <receiver
+                android:name=".MediaControlReceiver"
+                android:exported="false" />
             </application>
           </manifest>
           EOF
@@ -235,6 +309,22 @@ jobs:
               public static final String VERSION_NAME = "${APP_VERSION_NAME}";
               public static final int BUILD_NUMBER = ${GITHUB_RUN_NUMBER};
               public static final String CURRENT_TAG = "v${APP_VERSION_NAME}-build-${GITHUB_RUN_NUMBER}";
+          }
+          EOF
+
+          cat > app/src/main/java/com/mjaudio/player/MediaControlReceiver.java <<'EOF'
+          package com.mjaudio.player;
+
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+
+          public class MediaControlReceiver extends BroadcastReceiver {
+              @Override
+              public void onReceive(Context context, Intent intent) {
+                  if (intent == null || intent.getAction() == null) return;
+                  MediaPlaybackService.handleAction(context.getApplicationContext(), intent.getAction());
+              }
           }
           EOF
 
@@ -253,6 +343,7 @@ jobs:
           import android.content.SharedPreferences;
           import android.content.pm.ServiceInfo;
           import android.media.AudioManager;
+          import android.media.MediaMetadata;
           import android.media.MediaPlayer;
           import android.media.PlaybackParams;
           import android.media.audiofx.BassBoost;
@@ -262,12 +353,14 @@ jobs:
           import android.media.session.MediaSession;
           import android.media.session.PlaybackState;
           import android.os.Build;
+          import android.os.Bundle;
           import android.os.Handler;
           import android.os.IBinder;
           import android.os.Looper;
           import android.os.PowerManager;
           import android.widget.Toast;
 
+          import java.io.File;
           import java.util.ArrayList;
           import java.util.List;
 
@@ -283,6 +376,10 @@ jobs:
               public static final String ACTION_FORWARD = "JAHBAZ_ACTION_FORWARD";
               public static final String ACTION_NEXT = "JAHBAZ_ACTION_NEXT";
               public static final String ACTION_CLOSE = "JAHBAZ_ACTION_CLOSE";
+
+              public static final String CUSTOM_ACTION_REWIND = "MJ_CUSTOM_REWIND";
+              public static final String CUSTOM_ACTION_FORWARD = "MJ_CUSTOM_FORWARD";
+              public static final String CUSTOM_ACTION_CLOSE = "MJ_CUSTOM_CLOSE";
 
               public interface PlaybackListener {
                   void onPlaybackStateChanged();
@@ -340,7 +437,7 @@ jobs:
 
               private final Handler bgTickHandler = new Handler(Looper.getMainLooper());
               private Runnable bgTickRunnable;
-              private BroadcastReceiver controlReceiver;
+              private BroadcastReceiver noisyReceiver;
               private AudioManager.OnAudioFocusChangeListener focusChangeListener;
 
               @Override
@@ -349,9 +446,9 @@ jobs:
                   instance = this;
                   createNotificationChannel(this);
                   ensureMediaPlayer(this);
-                  setupMediaSession();
+                  ensureMediaSession(this);
                   setupAudioFocus();
-                  registerControlReceiver();
+                  registerNoisyReceiver();
                   startBackgroundTick();
               }
 
@@ -359,6 +456,15 @@ jobs:
               public int onStartCommand(Intent intent, int flags, int startId) {
                   createNotificationChannel(this);
                   ensureMediaPlayer(this);
+                  ensureMediaSession(this);
+
+                  if (intent != null && intent.getAction() != null) {
+                      String action = intent.getAction();
+                      if (!ACTION_START_PLAYBACK.equals(action)) {
+                          handleAction(this, action);
+                          return START_STICKY;
+                      }
+                  }
 
                   AudioItem item = getCurrentItem();
                   Notification notif = buildNotification(this, item, isPlaying);
@@ -391,8 +497,8 @@ jobs:
                       bgTickHandler.removeCallbacks(bgTickRunnable);
                   }
                   try {
-                      if (controlReceiver != null) {
-                          unregisterReceiver(controlReceiver);
+                      if (noisyReceiver != null) {
+                          unregisterReceiver(noisyReceiver);
                       }
                   } catch (Throwable ignored) {}
                   try {
@@ -402,6 +508,28 @@ jobs:
                       }
                   } catch (Throwable ignored) {}
                   instance = null;
+              }
+
+              public static void handleAction(final Context ctx, final String action) {
+                  if (action == null) return;
+                  final Context appCtx = ctx.getApplicationContext();
+                  mainHandler.post(() -> {
+                      try {
+                          if (ACTION_PREV.equals(action)) {
+                              playPreviousTrack(appCtx);
+                          } else if (ACTION_REWIND.equals(action) || CUSTOM_ACTION_REWIND.equals(action)) {
+                              seekAndUpdate(appCtx, -skipDuration);
+                          } else if (ACTION_PLAY.equals(action)) {
+                              togglePlayPause(appCtx);
+                          } else if (ACTION_FORWARD.equals(action) || CUSTOM_ACTION_FORWARD.equals(action)) {
+                              seekAndUpdate(appCtx, skipDuration);
+                          } else if (ACTION_NEXT.equals(action)) {
+                              playNextTrack(appCtx);
+                          } else if (ACTION_CLOSE.equals(action) || CUSTOM_ACTION_CLOSE.equals(action)) {
+                              stopPlaybackAndService(appCtx);
+                          }
+                      } catch (Throwable ignored) {}
+                  });
               }
 
               private void startForegroundCompat(Notification notif) {
@@ -438,49 +566,66 @@ jobs:
                   bgTickHandler.postDelayed(bgTickRunnable, 250);
               }
 
-              private void setupMediaSession() {
+              public static void ensureMediaSession(final Context ctx) {
                   try {
                       if (Build.VERSION.SDK_INT >= 21) {
+                          final Context appCtx = ctx.getApplicationContext();
                           if (mediaSession == null) {
-                              mediaSession = new MediaSession(getApplicationContext(), "MJ_Audio_Session");
+                              mediaSession = new MediaSession(appCtx, "MJ_Audio_Session");
+                              mediaSession.setFlags(
+                                      MediaSession.FLAG_HANDLES_MEDIA_BUTTONS
+                                              | MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS
+                              );
+                              mediaSession.setCallback(new MediaSession.Callback() {
+                                  @Override
+                                  public void onPlay() {
+                                      if (!isPlaying) togglePlayPause(appCtx);
+                                  }
+
+                                  @Override
+                                  public void onPause() {
+                                      if (isPlaying) togglePlayPause(appCtx);
+                                  }
+
+                                  @Override
+                                  public void onSkipToNext() {
+                                      playNextTrack(appCtx);
+                                  }
+
+                                  @Override
+                                  public void onSkipToPrevious() {
+                                      playPreviousTrack(appCtx);
+                                  }
+
+                                  @Override
+                                  public void onFastForward() {
+                                      seekAndUpdate(appCtx, skipDuration);
+                                  }
+
+                                  @Override
+                                  public void onRewind() {
+                                      seekAndUpdate(appCtx, -skipDuration);
+                                  }
+
+                                  @Override
+                                  public void onSeekTo(long pos) {
+                                      seekToPosition(appCtx, (int) pos);
+                                  }
+
+                                  @Override
+                                  public void onStop() {
+                                      stopPlaybackAndService(appCtx);
+                                  }
+
+                                  @Override
+                                  public void onCustomAction(String action, Bundle extras) {
+                                      handleAction(appCtx, action);
+                                  }
+                              });
                           }
-                          mediaSession.setCallback(new MediaSession.Callback() {
-                              @Override
-                              public void onPlay() {
-                                  if (!isPlaying) togglePlayPause(MediaPlaybackService.this);
-                              }
-
-                              @Override
-                              public void onPause() {
-                                  if (isPlaying) togglePlayPause(MediaPlaybackService.this);
-                              }
-
-                              @Override
-                              public void onSkipToNext() {
-                                  playNextTrack(MediaPlaybackService.this);
-                              }
-
-                              @Override
-                              public void onSkipToPrevious() {
-                                  playPreviousTrack(MediaPlaybackService.this);
-                              }
-
-                              @Override
-                              public void onFastForward() {
-                                  seekAndUpdate(MediaPlaybackService.this, skipDuration);
-                              }
-
-                              @Override
-                              public void onRewind() {
-                                  seekAndUpdate(MediaPlaybackService.this, -skipDuration);
-                              }
-
-                              @Override
-                              public void onStop() {
-                                  stopPlaybackAndService(MediaPlaybackService.this);
-                              }
-                          });
-                          mediaSession.setActive(true);
+                          if (!mediaSession.isActive()) {
+                              mediaSession.setActive(true);
+                          }
                       }
                   } catch (Throwable ignored) {}
               }
@@ -505,26 +650,12 @@ jobs:
                   } catch (Throwable ignored) {}
               }
 
-              private void registerControlReceiver() {
-                  controlReceiver = new BroadcastReceiver() {
+              private void registerNoisyReceiver() {
+                  noisyReceiver = new BroadcastReceiver() {
                       @Override
                       public void onReceive(Context context, Intent intent) {
                           try {
-                              if (intent == null || intent.getAction() == null) return;
-                              String action = intent.getAction();
-                              if (ACTION_PREV.equals(action)) {
-                                  playPreviousTrack(MediaPlaybackService.this);
-                              } else if (ACTION_REWIND.equals(action)) {
-                                  seekAndUpdate(MediaPlaybackService.this, -skipDuration);
-                              } else if (ACTION_PLAY.equals(action)) {
-                                  togglePlayPause(MediaPlaybackService.this);
-                              } else if (ACTION_FORWARD.equals(action)) {
-                                  seekAndUpdate(MediaPlaybackService.this, skipDuration);
-                              } else if (ACTION_NEXT.equals(action)) {
-                                  playNextTrack(MediaPlaybackService.this);
-                              } else if (ACTION_CLOSE.equals(action)) {
-                                  stopPlaybackAndService(MediaPlaybackService.this);
-                              } else if (AudioManager.ACTION_AUDIO_BECOMING_NOISY.equals(action)) {
+                              if (intent != null && AudioManager.ACTION_AUDIO_BECOMING_NOISY.equals(intent.getAction())) {
                                   if (mediaPlayer != null && mediaPlayer.isPlaying()) {
                                       togglePlayPause(MediaPlaybackService.this);
                                   }
@@ -532,20 +663,12 @@ jobs:
                           } catch (Throwable ignored) {}
                       }
                   };
-
-                  IntentFilter filter = new IntentFilter();
-                  filter.addAction(ACTION_PREV);
-                  filter.addAction(ACTION_REWIND);
-                  filter.addAction(ACTION_PLAY);
-                  filter.addAction(ACTION_FORWARD);
-                  filter.addAction(ACTION_NEXT);
-                  filter.addAction(ACTION_CLOSE);
-                  filter.addAction(AudioManager.ACTION_AUDIO_BECOMING_NOISY);
+                  IntentFilter filter = new IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY);
                   try {
                       if (Build.VERSION.SDK_INT >= 33) {
-                          registerReceiver(controlReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+                          registerReceiver(noisyReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
                       } else {
-                          registerReceiver(controlReceiver, filter);
+                          registerReceiver(noisyReceiver, filter);
                       }
                   } catch (Throwable ignored) {}
               }
@@ -764,6 +887,7 @@ jobs:
                   Context appCtx = ctx.getApplicationContext();
                   if (index < 0 || index >= displayList.size()) return;
                   ensureMediaPlayer(appCtx);
+                  ensureMediaSession(appCtx);
                   SharedPreferences prefs = getPrefs(appCtx);
 
                   AudioItem prev = getCurrentItem();
@@ -852,6 +976,7 @@ jobs:
               public static void togglePlayPause(Context ctx) {
                   Context appCtx = ctx.getApplicationContext();
                   ensureMediaPlayer(appCtx);
+                  ensureMediaSession(appCtx);
                   if (mediaPlayer == null) return;
                   try {
                       if (mediaPlayer.isPlaying()) {
@@ -869,6 +994,13 @@ jobs:
                       } else {
                           if (currentIndex == -1 && !displayList.isEmpty()) {
                               playAudioAtIndex(appCtx, 0);
+                          } else if (getCurrentItem() == null) {
+                              String lastPath = getPrefs(appCtx).getString("lastPlayingPath", "");
+                              if (!lastPath.isEmpty() && new File(lastPath).exists()) {
+                                  File lf = new File(lastPath);
+                                  displayList.add(new AudioItem(lf.getName(), lastPath, lf.lastModified(), lf.length(), 0));
+                                  playAudioAtIndex(appCtx, 0);
+                              }
                           } else {
                               mediaPlayer.start();
                               applyVoiceAndSpeed();
@@ -885,21 +1017,28 @@ jobs:
                   } catch (Throwable ignored) {}
               }
 
-              public static void seekAndUpdate(Context ctx, int change) {
+              public static void seekToPosition(Context ctx, int newPos) {
                   Context appCtx = ctx.getApplicationContext();
                   try {
                       if (mediaPlayer == null) return;
                       int dur = mediaPlayer.getDuration();
                       if (dur <= 0) return;
-                      int newPos = Math.max(0, Math.min(dur, mediaPlayer.getCurrentPosition() + change));
-                      mediaPlayer.seekTo(newPos);
+                      int clamped = Math.max(0, Math.min(dur, newPos));
+                      mediaPlayer.seekTo(clamped);
                       if (isPlaying) applyVoiceAndSpeed();
                       AudioItem item = getCurrentItem();
                       if (item != null) {
-                          getPrefs(appCtx).edit().putInt("pos_" + item.path, newPos).apply();
+                          getPrefs(appCtx).edit().putInt("pos_" + item.path, clamped).apply();
                       }
                       refreshForegroundNotification(appCtx);
                       notifyUi();
+                  } catch (Throwable ignored) {}
+              }
+
+              public static void seekAndUpdate(Context ctx, int change) {
+                  try {
+                      if (mediaPlayer == null) return;
+                      seekToPosition(ctx, mediaPlayer.getCurrentPosition() + change);
                   } catch (Throwable ignored) {}
               }
 
@@ -949,6 +1088,7 @@ jobs:
               public static void refreshForegroundNotification(Context ctx) {
                   Context appCtx = ctx.getApplicationContext();
                   try {
+                      ensureMediaSession(appCtx);
                       if (isPlaying) {
                           if (instance != null) {
                               Notification notif = buildNotification(instance, getCurrentItem(), true);
@@ -978,14 +1118,16 @@ jobs:
               }
 
               private static PendingIntent createActionPendingIntent(Context ctx, int requestCode, String action) {
-                  Intent intent = new Intent(action);
-                  intent.setPackage(ctx.getPackageName());
+                  Intent intent = new Intent(ctx.getApplicationContext(), MediaControlReceiver.class);
+                  intent.setAction(action);
                   int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
-                  return PendingIntent.getBroadcast(ctx, requestCode, intent, flags);
+                  return PendingIntent.getBroadcast(ctx.getApplicationContext(), requestCode, intent, flags);
               }
 
               public static Notification buildNotification(Context ctx, AudioItem item, boolean isPlay) {
                   createNotificationChannel(ctx);
+                  ensureMediaSession(ctx);
+
                   Notification.Builder builder = (Build.VERSION.SDK_INT >= 26)
                           ? new Notification.Builder(ctx, CHANNEL_ID)
                           : new Notification.Builder(ctx);
@@ -1023,29 +1165,46 @@ jobs:
                   try {
                       Notification.MediaStyle style = new Notification.MediaStyle();
                       style.setShowActionsInCompactView(1, 2, 3);
-                      if (Build.VERSION.SDK_INT >= 21) {
-                          if (mediaSession == null) {
-                              mediaSession = new MediaSession(ctx.getApplicationContext(), "MJ_Audio_Session");
-                              mediaSession.setActive(true);
-                          }
+                      if (Build.VERSION.SDK_INT >= 21 && mediaSession != null) {
                           style.setMediaSession(mediaSession.getSessionToken());
+
+                          long dur = 0;
+                          long pos = 0;
+                          try {
+                              if (mediaPlayer != null) {
+                                  dur = mediaPlayer.getDuration();
+                                  pos = mediaPlayer.getCurrentPosition();
+                              }
+                          } catch (Throwable ignored) {}
+
+                          MediaMetadata.Builder metaBuilder = new MediaMetadata.Builder()
+                                  .putString(MediaMetadata.METADATA_KEY_TITLE, titleToDisplay)
+                                  .putString(MediaMetadata.METADATA_KEY_ARTIST, "MJ Audio Player");
+                          if (dur > 0) {
+                              metaBuilder.putLong(MediaMetadata.METADATA_KEY_DURATION, dur);
+                          }
+                          mediaSession.setMetadata(metaBuilder.build());
 
                           PlaybackState.Builder stateBuilder = new PlaybackState.Builder();
                           int state = isPlay ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED;
-                          long pos = 0;
-                          try {
-                              if (mediaPlayer != null) pos = mediaPlayer.getCurrentPosition();
-                          } catch (Throwable ignored) {}
-                          stateBuilder.setState(state, pos, currentPlaybackSpeed);
+                          stateBuilder.setState(state, pos, isPlay ? currentPlaybackSpeed : 0f);
                           stateBuilder.setActions(
                                   PlaybackState.ACTION_PLAY
                                           | PlaybackState.ACTION_PAUSE
+                                          | PlaybackState.ACTION_PLAY_PAUSE
                                           | PlaybackState.ACTION_SKIP_TO_NEXT
                                           | PlaybackState.ACTION_SKIP_TO_PREVIOUS
                                           | PlaybackState.ACTION_FAST_FORWARD
                                           | PlaybackState.ACTION_REWIND
+                                          | PlaybackState.ACTION_SEEK_TO
                                           | PlaybackState.ACTION_STOP
                           );
+                          stateBuilder.addCustomAction(new PlaybackState.CustomAction.Builder(
+                                  CUSTOM_ACTION_REWIND, "Rewind", android.R.drawable.ic_media_rew).build());
+                          stateBuilder.addCustomAction(new PlaybackState.CustomAction.Builder(
+                                  CUSTOM_ACTION_FORWARD, "Forward", android.R.drawable.ic_media_ff).build());
+                          stateBuilder.addCustomAction(new PlaybackState.CustomAction.Builder(
+                                  CUSTOM_ACTION_CLOSE, "Close", android.R.drawable.ic_menu_close_clear_cancel).build());
                           mediaSession.setPlaybackState(stateBuilder.build());
                       }
                       builder.setStyle(style);
@@ -1087,6 +1246,8 @@ jobs:
           import android.os.Handler;
           import android.os.Looper;
           import android.os.StrictMode;
+          import android.os.storage.StorageManager;
+          import android.os.storage.StorageVolume;
           import android.provider.MediaStore;
           import android.provider.Settings;
           import android.text.InputType;
@@ -1107,6 +1268,7 @@ jobs:
           import android.widget.ListView;
           import android.widget.ScrollView;
           import android.widget.SeekBar;
+          import android.widget.Switch;
           import android.widget.TextView;
           import android.widget.Toast;
 
@@ -1115,8 +1277,10 @@ jobs:
 
           import java.io.BufferedReader;
           import java.io.File;
+          import java.io.FileReader;
           import java.io.InputStreamReader;
           import java.io.OutputStream;
+          import java.lang.reflect.Method;
           import java.net.HttpURLConnection;
           import java.net.URL;
           import java.net.URLEncoder;
@@ -1126,9 +1290,12 @@ jobs:
           import java.util.Collections;
           import java.util.Comparator;
           import java.util.HashMap;
+          import java.util.LinkedHashMap;
+          import java.util.LinkedHashSet;
           import java.util.List;
           import java.util.Locale;
           import java.util.Map;
+          import java.util.Set;
           import java.util.regex.Matcher;
           import java.util.regex.Pattern;
 
@@ -1136,22 +1303,24 @@ jobs:
 
           public class MainActivity extends Activity implements MediaPlaybackService.PlaybackListener {
 
-              // ==================== MODERN DARK PALETTE ====================
-              private static final int COLOR_BG           = 0xFF0D1117; // Deep midnight canvas
-              private static final int COLOR_CARD         = 0xFF161B22; // Elevated dark card
-              private static final int COLOR_CARD_PRESSED = 0xFF212936; // Pressed surface
-              private static final int COLOR_CHIP         = 0xFF1F2633; // Clean button pill
-              private static final int COLOR_BORDER       = 0xFF2B3444; // Subtle border
-              private static final int COLOR_ACTIVE_CARD  = 0xFF15263B; // Now playing card tint
-              private static final int COLOR_PRIMARY      = 0xFF2196F3; // Primary vibrant blue
-              private static final int COLOR_PRIMARY_DARK = 0xFF1565C0; // Pressed blue
-              private static final int COLOR_CYAN         = 0xFF26C6DA; // Highlight cyan
-              private static final int COLOR_SUCCESS      = 0xFF3FB950; // Green active state
-              private static final int COLOR_AMBER        = 0xFFFFB300; // A-B partial state
-              private static final int COLOR_DANGER       = 0xFFE53935; // Red button accent
-              private static final int COLOR_DANGER_DARK  = 0xFFB71C1C; // Pressed red
-              private static final int COLOR_TEXT_MAIN    = 0xFFF0F6FC; // Primary white text
-              private static final int COLOR_TEXT_SUB     = 0xFF8B949E; // Muted grey metadata
+              // ==================== DYNAMIC THEME PALETTE (DARK & LIGHT) ====================
+              private boolean isDarkMode = true;
+
+              private int colorBg;
+              private int colorCard;
+              private int colorCardPressed;
+              private int colorChip;
+              private int colorBorder;
+              private int colorActiveCard;
+              private int colorPrimary;
+              private int colorPrimaryDark;
+              private int colorAccent;
+              private int colorSuccess;
+              private int colorAmber;
+              private int colorDanger;
+              private int colorDangerDark;
+              private int colorTextMain;
+              private int colorTextSub;
 
               static class FolderInfo {
                   String name;
@@ -1238,7 +1407,94 @@ jobs:
               private long activeUpdateDownloadId = -1L;
               private BroadcastReceiver downloadCompleteReceiver;
 
-              // ==================== UI DESIGN HELPERS ====================
+              // ==================== THEME & UI DESIGN HELPERS ====================
+
+              private void applyThemeColors() {
+                  if (isDarkMode) {
+                      colorBg          = 0xFF0D1117;
+                      colorCard        = 0xFF161B22;
+                      colorCardPressed = 0xFF212936;
+                      colorChip        = 0xFF1F2633;
+                      colorBorder      = 0xFF2B3444;
+                      colorActiveCard  = 0xFF15263B;
+                      colorPrimary     = 0xFF2196F3;
+                      colorPrimaryDark = 0xFF1565C0;
+                      colorAccent      = 0xFF26C6DA;
+                      colorSuccess     = 0xFF2EA043;
+                      colorAmber       = 0xFFFFB300;
+                      colorDanger      = 0xFFE53935;
+                      colorDangerDark  = 0xFFB71C1C;
+                      colorTextMain    = 0xFFF0F6FC;
+                      colorTextSub     = 0xFF8B949E;
+                  } else {
+                      colorBg          = 0xFFF1F5F9;
+                      colorCard        = 0xFFFFFFFF;
+                      colorCardPressed = 0xFFE2E8F0;
+                      colorChip        = 0xFFE8EEF5;
+                      colorBorder      = 0xFFCBD5E1;
+                      colorActiveCard  = 0xFFE3F2FD;
+                      colorPrimary     = 0xFF1976D2;
+                      colorPrimaryDark = 0xFF0D47A1;
+                      colorAccent      = 0xFF0277BD;
+                      colorSuccess     = 0xFF2E7D32;
+                      colorAmber       = 0xFFFFB300;
+                      colorDanger      = 0xFFD32F2F;
+                      colorDangerDark  = 0xFFB71C1C;
+                      colorTextMain    = 0xFF0F172A;
+                      colorTextSub     = 0xFF475569;
+                  }
+              }
+
+              private void applySystemBars() {
+                  try {
+                      Window w = getWindow();
+                      w.setStatusBarColor(colorBg);
+                      w.setNavigationBarColor(colorCard);
+                      if (Build.VERSION.SDK_INT >= 23) {
+                          View decor = w.getDecorView();
+                          int flags = decor.getSystemUiVisibility();
+                          if (isDarkMode) {
+                              flags &= ~View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+                              if (Build.VERSION.SDK_INT >= 26) {
+                                  flags &= ~View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+                              }
+                          } else {
+                              flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+                              if (Build.VERSION.SDK_INT >= 26) {
+                                  flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+                              }
+                          }
+                          decor.setSystemUiVisibility(flags);
+                      }
+                  } catch (Throwable ignored) {}
+              }
+
+              private void rebuildUiForTheme() {
+                  boolean wasSearchVisible = (searchRowLayout != null && searchRowLayout.getVisibility() == View.VISIBLE);
+                  String savedSearchText = (searchInput != null) ? searchInput.getText().toString() : "";
+
+                  setTheme(isDarkMode
+                          ? android.R.style.Theme_Material_NoActionBar
+                          : android.R.style.Theme_Material_Light_NoActionBar);
+                  applyThemeColors();
+                  applySystemBars();
+                  buildUI();
+
+                  if (wasSearchVisible) {
+                      searchRowLayout.setVisibility(View.VISIBLE);
+                  }
+                  if (!savedSearchText.isEmpty()) {
+                      searchInput.setText(savedSearchText);
+                  }
+                  btnFavs.setText(showFavoritesOnly ? "All Audio" : "Favorites");
+                  btnViewMode.setText(isGridView ? "View: Grid" : "View: List");
+                  listView.setVisibility(isGridView ? View.GONE : View.VISIBLE);
+                  gridView.setVisibility(isGridView ? View.VISIBLE : View.GONE);
+
+                  renderDisplayList();
+                  updateFilterButtonsStyle();
+                  syncUiWithPlayer();
+              }
 
               private int dp(int value) {
                   return Math.round(value * getResources().getDisplayMetrics().density);
@@ -1272,32 +1528,32 @@ jobs:
                   btn.setMinimumWidth(0);
                   btn.setTextSize(12);
                   btn.setTypeface(null, active ? Typeface.BOLD : Typeface.NORMAL);
-                  btn.setTextColor(active ? Color.WHITE : COLOR_TEXT_MAIN);
+                  btn.setTextColor(active ? Color.WHITE : colorTextMain);
                   btn.setPadding(dp(12), dp(8), dp(12), dp(8));
                   if (active) {
-                      btn.setBackground(makeButtonDrawable(activeBg, COLOR_PRIMARY_DARK, activeBg, 18));
+                      btn.setBackground(makeButtonDrawable(activeBg, colorPrimaryDark, activeBg, 18));
                   } else {
-                      btn.setBackground(makeButtonDrawable(COLOR_CHIP, COLOR_CARD_PRESSED, COLOR_BORDER, 18));
+                      btn.setBackground(makeButtonDrawable(colorChip, colorCardPressed, colorBorder, 18));
                   }
               }
 
               private void styleEditText(EditText et, String hint) {
                   if (hint != null) et.setHint(hint);
-                  et.setTextColor(COLOR_TEXT_MAIN);
-                  et.setHintTextColor(COLOR_TEXT_SUB);
+                  et.setTextColor(colorTextMain);
+                  et.setHintTextColor(colorTextSub);
                   et.setTextSize(14);
                   et.setPadding(dp(14), dp(10), dp(14), dp(10));
-                  et.setBackground(makeCardDrawable(COLOR_BG, COLOR_BORDER, 10, 1));
+                  et.setBackground(makeCardDrawable(colorBg, colorBorder, 10, 1));
               }
 
-              private Button createDialogMenuButton(String text, int bgColor, int pressedColor, int strokeColor) {
+              private Button createDialogMenuButton(String text, int bgColor, int pressedColor, int strokeColor, int textColor) {
                   Button btn = new Button(ctx);
                   btn.setText(text);
                   btn.setAllCaps(false);
                   btn.setMinHeight(0);
                   btn.setMinimumHeight(0);
                   btn.setTextSize(14);
-                  btn.setTextColor(COLOR_TEXT_MAIN);
+                  btn.setTextColor(textColor);
                   btn.setTypeface(null, Typeface.BOLD);
                   btn.setPadding(dp(14), dp(12), dp(14), dp(12));
                   btn.setBackground(makeButtonDrawable(bgColor, pressedColor, strokeColor, 12));
@@ -1307,11 +1563,17 @@ jobs:
                   return btn;
               }
 
-              private AlertDialog.Builder darkDialog() {
-                  return new AlertDialog.Builder(ctx, android.R.style.Theme_Material_Dialog_Alert);
+              private int getDialogThemeRes() {
+                  return isDarkMode
+                          ? android.R.style.Theme_Material_Dialog_Alert
+                          : android.R.style.Theme_Material_Light_Dialog_Alert;
               }
 
-              private ArrayAdapter<String> createSimpleDarkAdapter(final List<String> items) {
+              private AlertDialog.Builder themedDialog() {
+                  return new AlertDialog.Builder(ctx, getDialogThemeRes());
+              }
+
+              private ArrayAdapter<String> createSimpleThemedAdapter(final List<String> items) {
                   return new ArrayAdapter<String>(ctx, android.R.layout.simple_list_item_1, items) {
                       @Override
                       public View getView(int position, View convertView, ViewGroup parent) {
@@ -1321,9 +1583,9 @@ jobs:
                           } else {
                               tv = new TextView(ctx);
                               tv.setTextSize(14);
-                              tv.setTextColor(COLOR_TEXT_MAIN);
                               tv.setPadding(dp(14), dp(12), dp(14), dp(12));
                           }
+                          tv.setTextColor(colorTextMain);
                           tv.setText(items.get(position));
                           return tv;
                       }
@@ -1332,12 +1594,12 @@ jobs:
 
               private void updateFilterButtonsStyle() {
                   try {
-                      stylePillButton(btnSearchTop, searchRowLayout.getVisibility() == View.VISIBLE, COLOR_PRIMARY);
-                      stylePillButton(btnFavs, showFavoritesOnly, COLOR_PRIMARY);
-                      stylePillButton(btnRecent, showRecentOnly, COLOR_PRIMARY);
-                      stylePillButton(btnPlaylists, currentPlaylistFilter != null, COLOR_PRIMARY);
-                      stylePillButton(btnFolders, !"ALL".equals(currentFolderFilter), COLOR_PRIMARY);
-                      stylePillButton(btnViewMode, isGridView, COLOR_PRIMARY);
+                      stylePillButton(btnSearchTop, searchRowLayout.getVisibility() == View.VISIBLE, colorPrimary);
+                      stylePillButton(btnFavs, showFavoritesOnly, colorPrimary);
+                      stylePillButton(btnRecent, showRecentOnly, colorPrimary);
+                      stylePillButton(btnPlaylists, currentPlaylistFilter != null, colorPrimary);
+                      stylePillButton(btnFolders, !"ALL".equals(currentFolderFilter), colorPrimary);
+                      stylePillButton(btnViewMode, isGridView, colorPrimary);
                   } catch (Throwable ignored) {}
               }
 
@@ -1348,12 +1610,6 @@ jobs:
                   super.onCreate(savedInstanceState);
                   ctx = this;
 
-                  try {
-                      Window w = getWindow();
-                      w.setStatusBarColor(COLOR_BG);
-                      w.setNavigationBarColor(COLOR_CARD);
-                  } catch (Throwable ignored) {}
-
                   prefs = ctx.getSharedPreferences("AudioPlayerProPrefs", Context.MODE_PRIVATE);
                   pinnedPrefs = ctx.getSharedPreferences("PinnedFoldersPrefs", Context.MODE_PRIVATE);
                   favPrefs = ctx.getSharedPreferences("AudioFavPrefs", Context.MODE_PRIVATE);
@@ -1361,6 +1617,13 @@ jobs:
                   recentPrefs = ctx.getSharedPreferences("AudioRecentPrefs", Context.MODE_PRIVATE);
                   playlistsPrefs = ctx.getSharedPreferences("AudioPlaylistsPrefs", Context.MODE_PRIVATE);
                   trashPrefs = ctx.getSharedPreferences("AudioTrashPrefs", Context.MODE_PRIVATE);
+
+                  isDarkMode = prefs.getBoolean("darkMode", true);
+                  setTheme(isDarkMode
+                          ? android.R.style.Theme_Material_NoActionBar
+                          : android.R.style.Theme_Material_Light_NoActionBar);
+                  applyThemeColors();
+                  applySystemBars();
 
                   MediaPlaybackService.skipDuration = prefs.getInt("skipDuration", 10000);
                   MediaPlaybackService.backgroundPlay = prefs.getBoolean("backgroundPlay", true);
@@ -1376,6 +1639,7 @@ jobs:
                   requestRequiredPermissions();
                   MediaPlaybackService.createNotificationChannel(ctx);
                   MediaPlaybackService.ensureMediaPlayer(ctx);
+                  MediaPlaybackService.ensureMediaSession(ctx);
                   try {
                       MediaPlaybackService.isPlaying = MediaPlaybackService.mediaPlayer.isPlaying();
                   } catch (Throwable ignored) {}
@@ -1435,16 +1699,16 @@ jobs:
 
                       if (MediaPlaybackService.abRepeatState == 1) {
                           btnABRepeat.setText("A-B (A Set)");
-                          btnABRepeat.setBackground(makeButtonDrawable(COLOR_AMBER, COLOR_AMBER, COLOR_AMBER, 16));
+                          btnABRepeat.setBackground(makeButtonDrawable(colorAmber, colorAmber, colorAmber, 16));
                           btnABRepeat.setTextColor(Color.BLACK);
                       } else if (MediaPlaybackService.abRepeatState == 2) {
                           btnABRepeat.setText("A-B (Active)");
-                          btnABRepeat.setBackground(makeButtonDrawable(COLOR_SUCCESS, COLOR_SUCCESS, COLOR_SUCCESS, 16));
-                          btnABRepeat.setTextColor(Color.BLACK);
+                          btnABRepeat.setBackground(makeButtonDrawable(colorSuccess, colorSuccess, colorSuccess, 16));
+                          btnABRepeat.setTextColor(Color.WHITE);
                       } else {
                           btnABRepeat.setText("A-B Repeat");
-                          btnABRepeat.setBackground(makeButtonDrawable(COLOR_CHIP, COLOR_CARD_PRESSED, COLOR_BORDER, 16));
-                          btnABRepeat.setTextColor(COLOR_TEXT_MAIN);
+                          btnABRepeat.setBackground(makeButtonDrawable(colorChip, colorCardPressed, colorBorder, 16));
+                          btnABRepeat.setTextColor(colorTextMain);
                       }
 
                       if (MediaPlaybackService.mediaPlayer != null && MediaPlaybackService.getCurrentItem() != null) {
@@ -1614,7 +1878,7 @@ jobs:
 
                   final ProgressDialog pd;
                   if (isManual) {
-                      pd = new ProgressDialog(ctx, android.R.style.Theme_Material_Dialog_Alert);
+                      pd = new ProgressDialog(ctx, getDialogThemeRes());
                       pd.setMessage("Checking for updates...");
                       pd.setCancelable(true);
                       pd.show();
@@ -1691,7 +1955,7 @@ jobs:
                                               + "\nLatest: " + releaseName
                                               + "\n\nWhat's New:\n" + notes;
 
-                                      AlertDialog.Builder builder = darkDialog()
+                                      AlertDialog.Builder builder = themedDialog()
                                               .setTitle("New Update Available!")
                                               .setMessage(msg)
                                               .setNegativeButton("Later", null);
@@ -1706,7 +1970,7 @@ jobs:
                                           builder.show();
                                       }
                                   } else if (isManual) {
-                                      darkDialog()
+                                      themedDialog()
                                               .setTitle("Up to Date")
                                               .setMessage("You already have the latest version.\n\nCurrent: v"
                                                       + UpdateConfig.VERSION_NAME + " (Build " + UpdateConfig.BUILD_NUMBER + ")")
@@ -1729,7 +1993,7 @@ jobs:
                   }).start();
               }
 
-              // ==================== PERMISSIONS & MODERN DARK UI ====================
+              // ==================== PERMISSIONS & MODERN ADAPTIVE UI ====================
 
               private void requestRequiredPermissions() {
                   if (Build.VERSION.SDK_INT >= 30) {
@@ -1783,14 +2047,14 @@ jobs:
               private void buildUI() {
                   LinearLayout mainLayout = new LinearLayout(ctx);
                   mainLayout.setOrientation(LinearLayout.VERTICAL);
-                  mainLayout.setBackgroundColor(COLOR_BG);
+                  mainLayout.setBackgroundColor(colorBg);
                   mainLayout.setLayoutParams(new LinearLayout.LayoutParams(-1, -1));
                   mainLayout.setPadding(dp(10), dp(10), dp(10), dp(10));
 
                   // ---- TOP HEADER & NAVIGATION CARD ----
                   LinearLayout topBarCard = new LinearLayout(ctx);
                   topBarCard.setOrientation(LinearLayout.VERTICAL);
-                  topBarCard.setBackground(makeCardDrawable(COLOR_CARD, COLOR_BORDER, 16, 1));
+                  topBarCard.setBackground(makeCardDrawable(colorCard, colorBorder, 16, 1));
                   topBarCard.setPadding(dp(12), dp(10), dp(12), dp(10));
                   LinearLayout.LayoutParams topCardLp = new LinearLayout.LayoutParams(-1, -2);
                   topCardLp.bottomMargin = dp(8);
@@ -1800,19 +2064,18 @@ jobs:
                   titleView.setText("MJ Audio Player");
                   titleView.setTextSize(21);
                   titleView.setTypeface(null, Typeface.BOLD);
-                  titleView.setTextColor(COLOR_CYAN);
+                  titleView.setTextColor(colorAccent);
                   titleView.setGravity(Gravity.CENTER);
                   topBarCard.addView(titleView);
 
                   TextView devView = new TextView(ctx);
                   devView.setText("Developer: Jahbaz hijbani");
                   devView.setTextSize(12);
-                  devView.setTextColor(COLOR_TEXT_SUB);
+                  devView.setTextColor(colorTextSub);
                   devView.setGravity(Gravity.CENTER);
                   devView.setPadding(0, dp(2), 0, dp(10));
                   topBarCard.addView(devView);
 
-                  // Row 1: Search, All Files, Sort, Favorites, View Mode
                   HorizontalScrollView topButtonScroll = new HorizontalScrollView(ctx);
                   topButtonScroll.setHorizontalScrollBarEnabled(false);
                   LinearLayout topButtonRow = new LinearLayout(ctx);
@@ -1823,37 +2086,36 @@ jobs:
 
                   btnSearchTop = new Button(ctx);
                   btnSearchTop.setText("Search");
-                  stylePillButton(btnSearchTop, false, COLOR_PRIMARY);
+                  stylePillButton(btnSearchTop, false, colorPrimary);
                   btnSearchTop.setLayoutParams(pillLp);
                   topButtonRow.addView(btnSearchTop);
 
                   Button btnAllFiles = new Button(ctx);
                   btnAllFiles.setText("All Files");
-                  stylePillButton(btnAllFiles, false, COLOR_PRIMARY);
+                  stylePillButton(btnAllFiles, false, colorPrimary);
                   btnAllFiles.setLayoutParams(pillLp);
                   topButtonRow.addView(btnAllFiles);
 
                   Button btnSort = new Button(ctx);
                   btnSort.setText("Sort");
-                  stylePillButton(btnSort, false, COLOR_PRIMARY);
+                  stylePillButton(btnSort, false, colorPrimary);
                   btnSort.setLayoutParams(pillLp);
                   topButtonRow.addView(btnSort);
 
                   btnFavs = new Button(ctx);
                   btnFavs.setText("Favorites");
-                  stylePillButton(btnFavs, false, COLOR_PRIMARY);
+                  stylePillButton(btnFavs, false, colorPrimary);
                   btnFavs.setLayoutParams(pillLp);
                   topButtonRow.addView(btnFavs);
 
                   btnViewMode = new Button(ctx);
                   btnViewMode.setText("View: List");
-                  stylePillButton(btnViewMode, false, COLOR_PRIMARY);
+                  stylePillButton(btnViewMode, false, colorPrimary);
                   topButtonRow.addView(btnViewMode);
 
                   topButtonScroll.addView(topButtonRow);
                   topBarCard.addView(topButtonScroll);
 
-                  // Row 2: Folders, Recent, Playlists
                   LinearLayout folderRowLayout = new LinearLayout(ctx);
                   folderRowLayout.setOrientation(LinearLayout.HORIZONTAL);
                   LinearLayout.LayoutParams folderRowLp = new LinearLayout.LayoutParams(-1, -2);
@@ -1865,25 +2127,24 @@ jobs:
 
                   btnFolders = new Button(ctx);
                   btnFolders.setText("Folders");
-                  stylePillButton(btnFolders, false, COLOR_PRIMARY);
+                  stylePillButton(btnFolders, false, colorPrimary);
                   btnFolders.setLayoutParams(navBtnLp);
                   folderRowLayout.addView(btnFolders);
 
                   btnRecent = new Button(ctx);
                   btnRecent.setText("Recent");
-                  stylePillButton(btnRecent, false, COLOR_PRIMARY);
+                  stylePillButton(btnRecent, false, colorPrimary);
                   btnRecent.setLayoutParams(navBtnLp);
                   folderRowLayout.addView(btnRecent);
 
                   btnPlaylists = new Button(ctx);
                   btnPlaylists.setText("Playlists");
-                  stylePillButton(btnPlaylists, false, COLOR_PRIMARY);
+                  stylePillButton(btnPlaylists, false, colorPrimary);
                   btnPlaylists.setLayoutParams(navBtnLp);
                   folderRowLayout.addView(btnPlaylists);
 
                   topBarCard.addView(folderRowLayout);
 
-                  // Status Info Row inside Header Card
                   LinearLayout metaRow = new LinearLayout(ctx);
                   metaRow.setOrientation(LinearLayout.HORIZONTAL);
                   metaRow.setGravity(Gravity.CENTER_VERTICAL);
@@ -1892,7 +2153,7 @@ jobs:
                   currentFolderView = new TextView(ctx);
                   currentFolderView.setText("Current: All Audio Files");
                   currentFolderView.setTextSize(12);
-                  currentFolderView.setTextColor(COLOR_SUCCESS);
+                  currentFolderView.setTextColor(colorSuccess);
                   currentFolderView.setSingleLine(true);
                   currentFolderView.setEllipsize(TextUtils.TruncateAt.END);
                   currentFolderView.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1f));
@@ -1900,7 +2161,7 @@ jobs:
 
                   fileCountView = new TextView(ctx);
                   fileCountView.setTextSize(12);
-                  fileCountView.setTextColor(COLOR_TEXT_SUB);
+                  fileCountView.setTextColor(colorTextSub);
                   fileCountView.setPadding(dp(8), 0, 0, 0);
                   metaRow.addView(fileCountView);
 
@@ -1911,7 +2172,7 @@ jobs:
                   searchRowLayout = new LinearLayout(ctx);
                   searchRowLayout.setOrientation(LinearLayout.HORIZONTAL);
                   searchRowLayout.setGravity(Gravity.CENTER_VERTICAL);
-                  searchRowLayout.setBackground(makeCardDrawable(COLOR_CARD, COLOR_BORDER, 14, 1));
+                  searchRowLayout.setBackground(makeCardDrawable(colorCard, colorBorder, 14, 1));
                   searchRowLayout.setPadding(dp(8), dp(6), dp(8), dp(6));
                   LinearLayout.LayoutParams searchLp = new LinearLayout.LayoutParams(-1, -2);
                   searchLp.bottomMargin = dp(8);
@@ -1928,7 +2189,7 @@ jobs:
 
                   Button btnSearchQuery = new Button(ctx);
                   btnSearchQuery.setText("Find");
-                  stylePillButton(btnSearchQuery, true, COLOR_PRIMARY);
+                  stylePillButton(btnSearchQuery, true, colorPrimary);
                   searchRowLayout.addView(btnSearchQuery);
 
                   mainLayout.addView(searchRowLayout);
@@ -1964,7 +2225,7 @@ jobs:
                   // ---- BOTTOM PLAYER DOCK CARD ----
                   LinearLayout bottomControlsContainer = new LinearLayout(ctx);
                   bottomControlsContainer.setOrientation(LinearLayout.VERTICAL);
-                  bottomControlsContainer.setBackground(makeCardDrawable(COLOR_CARD, COLOR_BORDER, 18, 1));
+                  bottomControlsContainer.setBackground(makeCardDrawable(colorCard, colorBorder, 18, 1));
                   bottomControlsContainer.setPadding(dp(10), dp(10), dp(10), dp(10));
                   bottomControlsContainer.setLayoutParams(new LinearLayout.LayoutParams(-1, -2));
 
@@ -1972,14 +2233,13 @@ jobs:
                   trackStatusView.setText("No Audio Selected");
                   trackStatusView.setTextSize(14);
                   trackStatusView.setTypeface(null, Typeface.BOLD);
-                  trackStatusView.setTextColor(COLOR_TEXT_MAIN);
+                  trackStatusView.setTextColor(colorTextMain);
                   trackStatusView.setSingleLine(true);
                   trackStatusView.setEllipsize(TextUtils.TruncateAt.END);
                   trackStatusView.setGravity(Gravity.CENTER);
                   trackStatusView.setPadding(dp(4), 0, dp(4), dp(6));
                   bottomControlsContainer.addView(trackStatusView);
 
-                  // SeekBar Row
                   LinearLayout seekBarLayout = new LinearLayout(ctx);
                   seekBarLayout.setOrientation(LinearLayout.HORIZONTAL);
                   seekBarLayout.setGravity(Gravity.CENTER_VERTICAL);
@@ -1987,17 +2247,17 @@ jobs:
                   timeCurrent = new TextView(ctx);
                   timeCurrent.setText("00:00");
                   timeCurrent.setTextSize(11);
-                  timeCurrent.setTextColor(COLOR_TEXT_SUB);
+                  timeCurrent.setTextColor(colorTextSub);
                   seekBarLayout.addView(timeCurrent);
 
                   seekBar = new SeekBar(ctx);
                   seekBar.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1f));
                   try {
                       if (seekBar.getProgressDrawable() != null) {
-                          seekBar.getProgressDrawable().setColorFilter(COLOR_CYAN, PorterDuff.Mode.SRC_IN);
+                          seekBar.getProgressDrawable().setColorFilter(colorAccent, PorterDuff.Mode.SRC_IN);
                       }
                       if (seekBar.getThumb() != null) {
-                          seekBar.getThumb().setColorFilter(COLOR_PRIMARY, PorterDuff.Mode.SRC_IN);
+                          seekBar.getThumb().setColorFilter(colorPrimary, PorterDuff.Mode.SRC_IN);
                       }
                   } catch (Throwable ignored) {}
                   seekBarLayout.addView(seekBar);
@@ -2005,12 +2265,11 @@ jobs:
                   timeTotal = new TextView(ctx);
                   timeTotal.setText("00:00");
                   timeTotal.setTextSize(11);
-                  timeTotal.setTextColor(COLOR_TEXT_SUB);
+                  timeTotal.setTextColor(colorTextSub);
                   seekBarLayout.addView(timeTotal);
 
                   bottomControlsContainer.addView(seekBarLayout);
 
-                  // Go To Time & A-B Repeat Chips
                   LinearLayout extraControlsRow = new LinearLayout(ctx);
                   extraControlsRow.setOrientation(LinearLayout.HORIZONTAL);
                   extraControlsRow.setGravity(Gravity.CENTER);
@@ -2021,7 +2280,7 @@ jobs:
 
                   Button btnGoTo = new Button(ctx);
                   btnGoTo.setText("Go To Time");
-                  stylePillButton(btnGoTo, false, COLOR_PRIMARY);
+                  stylePillButton(btnGoTo, false, colorPrimary);
                   btnGoTo.setTextSize(11);
                   btnGoTo.setPadding(dp(12), dp(5), dp(12), dp(5));
                   LinearLayout.LayoutParams btnGoToParams = new LinearLayout.LayoutParams(-2, -2);
@@ -2031,7 +2290,7 @@ jobs:
 
                   btnABRepeat = new Button(ctx);
                   btnABRepeat.setText("A-B Repeat");
-                  stylePillButton(btnABRepeat, false, COLOR_SUCCESS);
+                  stylePillButton(btnABRepeat, false, colorSuccess);
                   btnABRepeat.setTextSize(11);
                   btnABRepeat.setPadding(dp(12), dp(5), dp(12), dp(5));
                   LinearLayout.LayoutParams btnABParams = new LinearLayout.LayoutParams(-2, -2);
@@ -2041,7 +2300,6 @@ jobs:
 
                   bottomControlsContainer.addView(extraControlsRow);
 
-                  // Transport Controls Row
                   LinearLayout controlsLayout = new LinearLayout(ctx);
                   controlsLayout.setOrientation(LinearLayout.HORIZONTAL);
                   controlsLayout.setLayoutParams(new LinearLayout.LayoutParams(-1, -2));
@@ -2060,7 +2318,6 @@ jobs:
                   controlsLayout.addView(btnNext);
                   bottomControlsContainer.addView(controlsLayout);
 
-                  // Bottom Utility Row
                   LinearLayout bottomLayout = new LinearLayout(ctx);
                   bottomLayout.setOrientation(LinearLayout.HORIZONTAL);
                   bottomLayout.setGravity(Gravity.CENTER);
@@ -2176,19 +2433,7 @@ jobs:
                       @Override
                       public void onStopTrackingTouch(SeekBar sb) {
                           isUserSeeking = false;
-                          if (MediaPlaybackService.mediaPlayer != null) {
-                              try {
-                                  int pos = sb.getProgress();
-                                  MediaPlaybackService.mediaPlayer.seekTo(pos);
-                                  timeCurrent.setText(formatDuration(pos));
-                                  if (MediaPlaybackService.isPlaying) MediaPlaybackService.applyVoiceAndSpeed();
-                                  AudioItem item = MediaPlaybackService.getCurrentItem();
-                                  if (item != null) {
-                                      prefs.edit().putInt("pos_" + item.path, pos).apply();
-                                  }
-                                  MediaPlaybackService.refreshForegroundNotification(ctx);
-                              } catch (Throwable ignored) {}
-                          }
+                          MediaPlaybackService.seekToPosition(ctx, sb.getProgress());
                       }
                   });
               }
@@ -2203,12 +2448,12 @@ jobs:
                   btn.setMinimumWidth(0);
                   btn.setTextSize(isPrimary ? 12 : 11);
                   btn.setTypeface(null, Typeface.BOLD);
-                  btn.setTextColor(isPrimary ? Color.WHITE : COLOR_TEXT_MAIN);
+                  btn.setTextColor(isPrimary ? Color.WHITE : colorTextMain);
                   btn.setPadding(dp(4), dp(10), dp(4), dp(10));
                   if (isPrimary) {
-                      btn.setBackground(makeButtonDrawable(COLOR_PRIMARY, COLOR_PRIMARY_DARK, COLOR_CYAN, 14));
+                      btn.setBackground(makeButtonDrawable(colorPrimary, colorPrimaryDark, colorAccent, 14));
                   } else {
-                      btn.setBackground(makeButtonDrawable(COLOR_CHIP, COLOR_CARD_PRESSED, COLOR_BORDER, 14));
+                      btn.setBackground(makeButtonDrawable(colorChip, colorCardPressed, colorBorder, 14));
                   }
                   LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -2, isPrimary ? 1.25f : 1.0f);
                   params.setMargins(dp(3), dp(2), dp(3), dp(2));
@@ -2225,9 +2470,9 @@ jobs:
                   btn.setMinWidth(0);
                   btn.setMinimumWidth(0);
                   btn.setTextSize(10);
-                  btn.setTextColor(COLOR_TEXT_MAIN);
+                  btn.setTextColor(colorTextMain);
                   btn.setPadding(dp(3), dp(8), dp(3), dp(8));
-                  btn.setBackground(makeButtonDrawable(COLOR_BG, COLOR_CARD_PRESSED, COLOR_BORDER, 10));
+                  btn.setBackground(makeButtonDrawable(colorBg, colorCardPressed, colorBorder, 10));
                   LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -2, 1.0f);
                   params.setMargins(dp(3), 0, dp(3), 0);
                   btn.setLayoutParams(params);
@@ -2423,13 +2668,13 @@ jobs:
                                   "Size: %.1f MB  •  Time: %s  •  %s", sizeMB, durStr, fileType));
 
                           if (isCurrent) {
-                              holder.card.setBackground(makeCardDrawable(COLOR_ACTIVE_CARD, COLOR_PRIMARY, 12, 1));
-                              holder.titleText.setTextColor(COLOR_CYAN);
-                              holder.metaText.setTextColor(COLOR_TEXT_MAIN);
+                              holder.card.setBackground(makeCardDrawable(colorActiveCard, colorPrimary, 12, 1));
+                              holder.titleText.setTextColor(colorAccent);
+                              holder.metaText.setTextColor(colorTextMain);
                           } else {
-                              holder.card.setBackground(makeCardDrawable(COLOR_CARD, COLOR_BORDER, 12, 1));
-                              holder.titleText.setTextColor(COLOR_TEXT_MAIN);
-                              holder.metaText.setTextColor(COLOR_TEXT_SUB);
+                              holder.card.setBackground(makeCardDrawable(colorCard, colorBorder, 12, 1));
+                              holder.titleText.setTextColor(colorTextMain);
+                              holder.metaText.setTextColor(colorTextSub);
                           }
 
                           return convertView;
@@ -2516,7 +2761,7 @@ jobs:
                       if (!pName.isEmpty()) pList.add(pName);
                   }
 
-                  darkDialog()
+                  themedDialog()
                           .setTitle("Playlists")
                           .setItems(pList.toArray(new String[0]), (dialog, which) -> {
                               if (which == 0) {
@@ -2527,7 +2772,7 @@ jobs:
                                   input.setLayoutParams(new LinearLayout.LayoutParams(-1, -2));
                                   wrap.addView(input);
 
-                                  darkDialog()
+                                  themedDialog()
                                           .setTitle("New Playlist Name")
                                           .setView(wrap)
                                           .setPositiveButton("Create", (d, w) -> {
@@ -2560,7 +2805,7 @@ jobs:
                   input.setLayoutParams(new LinearLayout.LayoutParams(-1, -2));
                   wrap.addView(input);
 
-                  darkDialog()
+                  themedDialog()
                           .setTitle("Go To Time")
                           .setView(wrap)
                           .setPositiveButton("Go", (d, w) -> {
@@ -2584,7 +2829,7 @@ jobs:
                               if (millis > 0) {
                                   try {
                                       if (millis <= MediaPlaybackService.mediaPlayer.getDuration()) {
-                                          MediaPlaybackService.mediaPlayer.seekTo(millis);
+                                          MediaPlaybackService.seekToPosition(ctx, millis);
                                           seekBar.setProgress(millis);
                                           timeCurrent.setText(formatDuration(millis));
                                       } else {
@@ -2630,7 +2875,7 @@ jobs:
                           "Size (Largest First)", "Size (Smallest First)",
                           "Path (A to Z)"
                   };
-                  darkDialog()
+                  themedDialog()
                           .setTitle("Advanced Sort Fields")
                           .setItems(options, (dialog, which) -> {
                               currentSortOrder = options[which];
@@ -2650,7 +2895,7 @@ jobs:
                   for (int i = 0; i < 5; i++) {
                       TextView label = new TextView(ctx);
                       label.setText("Band " + (i + 1));
-                      label.setTextColor(COLOR_TEXT_MAIN);
+                      label.setTextColor(colorTextMain);
                       label.setTextSize(13);
                       label.setPadding(0, dp(6), 0, dp(2));
                       layout.addView(label);
@@ -2660,17 +2905,17 @@ jobs:
                       sb.setProgress(MediaPlaybackService.customEqBands[i] + 1500);
                       try {
                           if (sb.getProgressDrawable() != null) {
-                              sb.getProgressDrawable().setColorFilter(COLOR_CYAN, PorterDuff.Mode.SRC_IN);
+                              sb.getProgressDrawable().setColorFilter(colorAccent, PorterDuff.Mode.SRC_IN);
                           }
                           if (sb.getThumb() != null) {
-                              sb.getThumb().setColorFilter(COLOR_PRIMARY, PorterDuff.Mode.SRC_IN);
+                              sb.getThumb().setColorFilter(colorPrimary, PorterDuff.Mode.SRC_IN);
                           }
                       } catch (Throwable ignored) {}
                       layout.addView(sb);
                       seekBars[i] = sb;
                   }
 
-                  darkDialog()
+                  themedDialog()
                           .setTitle("Custom Equalizer")
                           .setView(layout)
                           .setPositiveButton("Apply", (d, w) -> {
@@ -2689,23 +2934,50 @@ jobs:
                           .show();
               }
 
-              private String getSdCardPath() {
-                  String sdPath = null;
+              // ==================== 4-LAYER SD CARD DETECTION (ANDROID 7 TO 15) ====================
+
+              private Map<String, String> getAvailableStorages() {
+                  Map<String, String> storages = new LinkedHashMap<>();
+                  String internalPath = Environment.getExternalStorageDirectory().getAbsolutePath();
+                  storages.put(internalPath, "Internal storage");
+
+                  // Layer 1: Official StorageManager API (Android 7+)
                   try {
-                      File[] files = ctx.getExternalFilesDirs(null);
-                      if (files != null && files.length > 1) {
-                          Pattern p = Pattern.compile("^(/storage/[^/]+)");
-                          for (File f : files) {
-                              if (f != null) {
-                                  Matcher m = p.matcher(f.getAbsolutePath());
-                                  if (m.find()) {
-                                      String sdRoot = m.group(1);
-                                      if (sdRoot != null && !sdRoot.contains("emulated") && !sdRoot.contains("self")) {
-                                          File testDir = new File(sdRoot);
-                                          if (testDir.exists() && testDir.canRead()) {
-                                              sdPath = sdRoot;
-                                              break;
-                                          }
+                      StorageManager sm = (StorageManager) ctx.getSystemService(Context.STORAGE_SERVICE);
+                      if (sm != null && Build.VERSION.SDK_INT >= 24) {
+                          List<StorageVolume> volumes = sm.getStorageVolumes();
+                          if (volumes != null) {
+                              for (StorageVolume vol : volumes) {
+                                  if (vol == null || vol.isPrimary()) continue;
+                                  if (!Environment.MEDIA_MOUNTED.equals(vol.getState())) continue;
+
+                                  String volPath = null;
+                                  if (Build.VERSION.SDK_INT >= 30) {
+                                      File dir = vol.getDirectory();
+                                      if (dir != null) volPath = dir.getAbsolutePath();
+                                  }
+                                  if (volPath == null) {
+                                      try {
+                                          Method mGetPath = vol.getClass().getMethod("getPath");
+                                          Object res = mGetPath.invoke(vol);
+                                          if (res instanceof String) volPath = (String) res;
+                                      } catch (Throwable ignored) {}
+                                  }
+                                  if (volPath == null) {
+                                      String uuid = vol.getUuid();
+                                      if (uuid != null && !uuid.isEmpty()) {
+                                          volPath = "/storage/" + uuid;
+                                      }
+                                  }
+
+                                  if (volPath != null && !volPath.equals(internalPath) && !storages.containsKey(volPath)) {
+                                      File d = new File(volPath);
+                                      if (d.exists() && d.isDirectory()) {
+                                          String desc = vol.getDescription(ctx);
+                                          String label = (desc != null && !desc.trim().isEmpty())
+                                                  ? "SD card (" + desc + ")"
+                                                  : "SD card";
+                                          storages.put(volPath, label);
                                       }
                                   }
                               }
@@ -2713,25 +2985,68 @@ jobs:
                       }
                   } catch (Throwable ignored) {}
 
-                  if (sdPath == null) {
-                      try {
-                          File storageDir = new File("/storage");
-                          if (storageDir.exists()) {
-                              File[] dirs = storageDir.listFiles();
-                              if (dirs != null) {
-                                  for (File d : dirs) {
-                                      String name = d.getName();
-                                      if (!"emulated".equals(name) && !"self".equals(name)
-                                              && d.isDirectory() && d.canRead()) {
-                                          sdPath = d.getAbsolutePath();
-                                          break;
+                  // Layer 2: Context.getExternalFilesDirs(null)
+                  try {
+                      File[] files = ctx.getExternalFilesDirs(null);
+                      if (files != null) {
+                          Pattern p = Pattern.compile("^(/storage/[^/]+)");
+                          for (File f : files) {
+                              if (f == null) continue;
+                              Matcher m = p.matcher(f.getAbsolutePath());
+                              if (m.find()) {
+                                  String sdRoot = m.group(1);
+                                  if (sdRoot != null && !sdRoot.contains("emulated") && !sdRoot.contains("self")
+                                          && !sdRoot.equals(internalPath) && !storages.containsKey(sdRoot)) {
+                                      File d = new File(sdRoot);
+                                      if (d.exists() && d.isDirectory()) {
+                                          storages.put(sdRoot, "SD card");
                                       }
                                   }
                               }
                           }
-                      } catch (Throwable ignored) {}
-                  }
-                  return sdPath;
+                      }
+                  } catch (Throwable ignored) {}
+
+                  // Layer 3: Direct /storage directory scan
+                  try {
+                      File storageDir = new File("/storage");
+                      if (storageDir.exists()) {
+                          File[] dirs = storageDir.listFiles();
+                          if (dirs != null) {
+                              for (File d : dirs) {
+                                  String name = d.getName();
+                                  String abs = d.getAbsolutePath();
+                                  if (!"emulated".equals(name) && !"self".equals(name)
+                                          && !name.contains("emulated")
+                                          && d.isDirectory() && d.exists()
+                                          && !abs.equals(internalPath) && !storages.containsKey(abs)) {
+                                      storages.put(abs, "SD card (" + name + ")");
+                                  }
+                              }
+                          }
+                      }
+                  } catch (Throwable ignored) {}
+
+                  // Layer 4: /proc/mounts fallback
+                  try (BufferedReader br = new BufferedReader(new FileReader("/proc/mounts"))) {
+                      Pattern mp = Pattern.compile(" (/storage/[A-Za-z0-9_.-]+) ");
+                      String line;
+                      while ((line = br.readLine()) != null) {
+                          Matcher m = mp.matcher(line);
+                          if (m.find()) {
+                              String mountPath = m.group(1);
+                              if (mountPath != null && !mountPath.contains("emulated") && !mountPath.contains("self")
+                                      && !mountPath.equals(internalPath) && !storages.containsKey(mountPath)) {
+                                  File d = new File(mountPath);
+                                  if (d.exists() && d.isDirectory()) {
+                                      storages.put(mountPath, "SD card");
+                                  }
+                              }
+                          }
+                      }
+                  } catch (Throwable ignored) {}
+
+                  return storages;
               }
 
               private boolean isAudioFileName(String name) {
@@ -2748,12 +3063,21 @@ jobs:
                       return;
                   }
 
-                  String rootInternal = Environment.getExternalStorageDirectory().getAbsolutePath();
-                  String sdPath = getSdCardPath();
-                  boolean isRoot = dirPath.equals(rootInternal) || (sdPath != null && dirPath.equals(sdPath));
+                  Set<String> storageRoots = new LinkedHashSet<>(getAvailableStorages().keySet());
+                  boolean isRoot = storageRoots.contains(dirPath);
 
                   File[] files = null;
                   try { files = f.listFiles(); } catch (Throwable ignored) {}
+
+                  if (files == null && Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) {
+                      Toast.makeText(ctx, "Allow 'All Files Access' permission to browse SD Card.", Toast.LENGTH_LONG).show();
+                      try {
+                          Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+                          intent.setData(Uri.parse("package:" + getPackageName()));
+                          startActivity(intent);
+                      } catch (Throwable ignored) {}
+                      return;
+                  }
 
                   List<BrowserItem> list = new ArrayList<>();
                   if (files != null) {
@@ -2794,12 +3118,12 @@ jobs:
                   }
 
                   ListView lv = new ListView(ctx);
-                  lv.setBackgroundColor(COLOR_CARD);
-                  lv.setDivider(new ColorDrawable(COLOR_BORDER));
+                  lv.setBackgroundColor(colorCard);
+                  lv.setDivider(new ColorDrawable(colorBorder));
                   lv.setDividerHeight(1);
-                  lv.setAdapter(createSimpleDarkAdapter(finalNames));
+                  lv.setAdapter(createSimpleThemedAdapter(finalNames));
 
-                  AlertDialog.Builder builder = darkDialog();
+                  AlertDialog.Builder builder = themedDialog();
                   builder.setTitle("0".equals(f.getName()) ? "Internal Storage" : f.getName());
                   builder.setView(lv);
 
@@ -2874,19 +3198,11 @@ jobs:
                       } catch (Throwable ignored) {}
                       return;
                   }
-                  String internalPath = Environment.getExternalStorageDirectory().getAbsolutePath();
-                  String sdPath = getSdCardPath();
-                  final List<String> options = new ArrayList<>();
-                  final List<String> paths = new ArrayList<>();
-                  options.add("Internal storage");
-                  paths.add(internalPath);
+                  Map<String, String> storages = getAvailableStorages();
+                  final List<String> paths = new ArrayList<>(storages.keySet());
+                  final List<String> options = new ArrayList<>(storages.values());
 
-                  if (sdPath != null) {
-                      options.add("SD card");
-                      paths.add(sdPath);
-                  }
-
-                  darkDialog()
+                  themedDialog()
                           .setTitle("Select Storage")
                           .setItems(options.toArray(new String[0]), (dialog, which) -> showFileBrowser(paths.get(which)))
                           .show();
@@ -2950,13 +3266,13 @@ jobs:
                       folderNames.add(prefix + info.name + " (" + info.count + ")");
                   }
 
-                  AlertDialog.Builder builder = darkDialog();
+                  AlertDialog.Builder builder = themedDialog();
                   builder.setTitle("Select Folder");
                   ListView flistView = new ListView(ctx);
-                  flistView.setBackgroundColor(COLOR_CARD);
-                  flistView.setDivider(new ColorDrawable(COLOR_BORDER));
+                  flistView.setBackgroundColor(colorCard);
+                  flistView.setDivider(new ColorDrawable(colorBorder));
                   flistView.setDividerHeight(1);
-                  flistView.setAdapter(createSimpleDarkAdapter(folderNames));
+                  flistView.setAdapter(createSimpleThemedAdapter(folderNames));
                   builder.setView(flistView);
 
                   final AlertDialog folderDialog = builder.create();
@@ -2986,7 +3302,7 @@ jobs:
                       final boolean isPinned = pinnedPrefs.getBoolean(path, false);
                       String[] options = {isPinned ? "Unpin Folder" : "Pin Folder", "Rename Folder"};
 
-                      darkDialog()
+                      themedDialog()
                               .setItems(options, (d, w) -> {
                                   if (w == 0) {
                                       if (isPinned) {
@@ -3007,7 +3323,7 @@ jobs:
                                       renameInput.setLayoutParams(new LinearLayout.LayoutParams(-1, -2));
                                       wrap.addView(renameInput);
 
-                                      darkDialog()
+                                      themedDialog()
                                               .setTitle("Rename Folder")
                                               .setView(wrap)
                                               .setPositiveButton("Save", (d2, w2) -> {
@@ -3054,7 +3370,7 @@ jobs:
                       }
                   }
 
-                  darkDialog()
+                  themedDialog()
                           .setTitle("Select Voice Effect")
                           .setSingleChoiceItems(effectsList, checkedIdx, (dialog, position) -> {
                               MediaPlaybackService.currentVoiceEffect = effectsList[position];
@@ -3074,7 +3390,7 @@ jobs:
                           "1.25x", "1.50x", "1.75x", "2.00x (Fast)",
                           "2.25x", "2.50x", "2.75x", "3.00x (Very Fast)"
                   };
-                  darkDialog()
+                  themedDialog()
                           .setTitle("Select Global Audio Speed")
                           .setItems(speedNames, (dialog, which) -> {
                               MediaPlaybackService.currentPlaybackSpeed = speedOptions[which];
@@ -3110,7 +3426,7 @@ jobs:
                       };
                   }
 
-                  darkDialog()
+                  themedDialog()
                           .setTitle(tagsPrefs.getString(item.path + "_title", item.name))
                           .setItems(options, (dialog, which) -> {
                               if (inTrash) {
@@ -3147,7 +3463,7 @@ jobs:
                                               + "\n\nFormat: " + ext.toUpperCase(Locale.ROOT)
                                               + "\n\nSize: " + String.format(Locale.US, "%.2f MB", sizeMB)
                                               + "\n\nDuration: " + formatDuration(durMs);
-                                      darkDialog()
+                                      themedDialog()
                                               .setTitle("Audio Info")
                                               .setMessage(infoMsg)
                                               .setPositiveButton("OK", null)
@@ -3182,7 +3498,7 @@ jobs:
                                       renameInput.setLayoutParams(new LinearLayout.LayoutParams(-1, -2));
                                       wrap.addView(renameInput);
 
-                                      darkDialog()
+                                      themedDialog()
                                               .setTitle("Rename Audio")
                                               .setView(wrap)
                                               .setPositiveButton("Save", (d, w) -> {
@@ -3213,7 +3529,7 @@ jobs:
                                       tagInput.setLayoutParams(new LinearLayout.LayoutParams(-1, -2));
                                       wrap.addView(tagInput);
 
-                                      darkDialog()
+                                      themedDialog()
                                               .setTitle("Edit Display Title")
                                               .setView(wrap)
                                               .setPositiveButton("Save", (d, w) -> {
@@ -3235,7 +3551,7 @@ jobs:
                                       if (pList.isEmpty()) {
                                           Toast.makeText(ctx, "No playlists created yet. Create one first.", Toast.LENGTH_SHORT).show();
                                       } else {
-                                          darkDialog()
+                                          themedDialog()
                                                   .setTitle("Select Playlist")
                                                   .setItems(pList.toArray(new String[0]), (d, w) -> {
                                                       String pName = pList.get(w);
@@ -3271,7 +3587,7 @@ jobs:
                           presetNames[i] = MediaPlaybackService.globalEq.getPresetName(i);
                       }
 
-                      darkDialog()
+                      themedDialog()
                               .setTitle("EQ Presets")
                               .setItems(presetNames, (dialog, which) -> {
                                   MediaPlaybackService.currentEqPreset = which;
@@ -3287,7 +3603,7 @@ jobs:
               private void showSuccessDialog(final AlertDialog parentDialog) {
                   LinearLayout layout = new LinearLayout(ctx);
                   layout.setOrientation(LinearLayout.VERTICAL);
-                  layout.setBackgroundColor(COLOR_CARD);
+                  layout.setBackgroundColor(colorCard);
                   layout.setPadding(dp(24), dp(24), dp(24), dp(24));
                   layout.setGravity(Gravity.CENTER);
 
@@ -3295,15 +3611,15 @@ jobs:
                   msgText.setText("Feedback sent successfully!");
                   msgText.setTextSize(17);
                   msgText.setTypeface(null, Typeface.BOLD);
-                  msgText.setTextColor(COLOR_SUCCESS);
+                  msgText.setTextColor(colorSuccess);
                   msgText.setGravity(Gravity.CENTER);
                   msgText.setPadding(0, 0, 0, dp(20));
                   layout.addView(msgText);
 
-                  Button btnOk = createDialogMenuButton("OK", COLOR_PRIMARY, COLOR_PRIMARY_DARK, COLOR_CYAN);
+                  Button btnOk = createDialogMenuButton("OK", colorPrimary, colorPrimaryDark, colorAccent, Color.WHITE);
                   layout.addView(btnOk);
 
-                  final AlertDialog successDialog = darkDialog().setView(layout).create();
+                  final AlertDialog successDialog = themedDialog().setView(layout).create();
                   successDialog.show();
                   btnOk.setOnClickListener(v -> {
                       successDialog.dismiss();
@@ -3313,7 +3629,7 @@ jobs:
 
               private void openFeedbackDialog() {
                   ScrollView scroll = new ScrollView(ctx);
-                  scroll.setBackgroundColor(COLOR_CARD);
+                  scroll.setBackgroundColor(colorCard);
                   LinearLayout layout = new LinearLayout(ctx);
                   layout.setOrientation(LinearLayout.VERTICAL);
                   layout.setPadding(dp(20), dp(20), dp(20), dp(20));
@@ -3323,7 +3639,7 @@ jobs:
                   title.setTextSize(18);
                   title.setTypeface(null, Typeface.BOLD);
                   title.setGravity(Gravity.CENTER);
-                  title.setTextColor(COLOR_CYAN);
+                  title.setTextColor(colorAccent);
                   title.setPadding(0, 0, 0, dp(14));
                   layout.addView(title);
 
@@ -3334,7 +3650,7 @@ jobs:
                   styleEditText(editAppName, null);
                   editAppName.setText("App: MJ Audio Player");
                   editAppName.setEnabled(false);
-                  editAppName.setTextColor(COLOR_TEXT_SUB);
+                  editAppName.setTextColor(colorTextSub);
                   editAppName.setLayoutParams(fieldLp);
                   layout.addView(editAppName);
 
@@ -3356,14 +3672,14 @@ jobs:
                   editMsg.setLayoutParams(fieldLp);
                   layout.addView(editMsg);
 
-                  Button btnSend = createDialogMenuButton("SEND FEEDBACK", COLOR_PRIMARY, COLOR_PRIMARY_DARK, COLOR_CYAN);
+                  Button btnSend = createDialogMenuButton("SEND FEEDBACK", colorPrimary, colorPrimaryDark, colorAccent, Color.WHITE);
                   layout.addView(btnSend);
 
-                  Button btnBack = createDialogMenuButton("GO BACK", COLOR_DANGER, COLOR_DANGER_DARK, COLOR_DANGER);
+                  Button btnBack = createDialogMenuButton("GO BACK", colorDanger, colorDangerDark, colorDanger, Color.WHITE);
                   layout.addView(btnBack);
 
                   scroll.addView(layout);
-                  final AlertDialog mainDialog = darkDialog().setView(scroll).create();
+                  final AlertDialog mainDialog = themedDialog().setView(scroll).create();
                   mainDialog.show();
 
                   btnBack.setOnClickListener(v -> mainDialog.dismiss());
@@ -3381,7 +3697,15 @@ jobs:
                           return;
                       }
 
-                      final ProgressDialog pd = new ProgressDialog(ctx, android.R.style.Theme_Material_Dialog_Alert);
+                      final String botToken = FeedbackConfig.getA();
+                      final String chatId = FeedbackConfig.getB();
+                      final String apiUrl = FeedbackConfig.getC();
+                      if (botToken.isEmpty() || chatId.isEmpty() || apiUrl.isEmpty()) {
+                          Toast.makeText(ctx, "Feedback secrets not set in GitHub Actions.", Toast.LENGTH_LONG).show();
+                          return;
+                      }
+
+                      final ProgressDialog pd = new ProgressDialog(ctx, getDialogThemeRes());
                       pd.setMessage("Sending please wait...");
                       pd.setCancelable(false);
                       pd.show();
@@ -3389,10 +3713,6 @@ jobs:
                       new Thread(() -> {
                           int responseCode = -1;
                           try {
-                              String BOT_TOKEN = "8779947243:AAEC3HYql5KbbJnJZTe7YYB2rIQK-xoJab8";
-                              String CHAT_ID = "7390973466";
-                              String VERCEL_URL = "https://send-feedback-dusky.vercel.app/api";
-
                               StringBuilder fullText = new StringBuilder();
                               fullText.append("New Feedback Received:\nApp: MJ Audio Player\nName: ")
                                       .append(!name.isEmpty() ? name : "Anonymous");
@@ -3401,11 +3721,11 @@ jobs:
                               }
                               fullText.append("\nFeedback: ").append(msg);
 
-                              String postData = "bot_token=" + URLEncoder.encode(BOT_TOKEN, "UTF-8")
-                                      + "&chat_id=" + URLEncoder.encode(CHAT_ID, "UTF-8")
+                              String postData = "bot_token=" + URLEncoder.encode(botToken, "UTF-8")
+                                      + "&chat_id=" + URLEncoder.encode(chatId, "UTF-8")
                                       + "&text=" + URLEncoder.encode(fullText.toString(), "UTF-8");
 
-                              URL url = new URL(VERCEL_URL);
+                              URL url = new URL(apiUrl);
                               HttpURLConnection conn = (HttpURLConnection) url.openConnection();
                               conn.setRequestMethod("POST");
                               conn.setDoOutput(true);
@@ -3445,29 +3765,67 @@ jobs:
               }
 
               private void showSettingsDialog() {
-                  AlertDialog.Builder settingsDialog = darkDialog();
-                  settingsDialog.setTitle("Settings");
+                  AlertDialog.Builder settingsBuilder = themedDialog();
+                  settingsBuilder.setTitle("Settings");
                   ScrollView layout = new ScrollView(ctx);
-                  layout.setBackgroundColor(COLOR_CARD);
+                  layout.setBackgroundColor(colorCard);
                   LinearLayout innerLayout = new LinearLayout(ctx);
                   innerLayout.setOrientation(LinearLayout.VERTICAL);
                   innerLayout.setPadding(dp(16), dp(12), dp(16), dp(12));
                   layout.addView(innerLayout);
 
-                  Button btnSleep = createDialogMenuButton("Sleep Timer", COLOR_CHIP, COLOR_CARD_PRESSED, COLOR_BORDER);
+                  final AlertDialog[] dlgRef = new AlertDialog[1];
+
+                  // ---- DARK / LIGHT MODE TOGGLE ROW ----
+                  LinearLayout themeRow = new LinearLayout(ctx);
+                  themeRow.setOrientation(LinearLayout.HORIZONTAL);
+                  themeRow.setGravity(Gravity.CENTER_VERTICAL);
+                  themeRow.setBackground(makeCardDrawable(colorChip, colorBorder, 12, 1));
+                  themeRow.setPadding(dp(14), dp(10), dp(14), dp(10));
+                  LinearLayout.LayoutParams themeRowLp = new LinearLayout.LayoutParams(-1, -2);
+                  themeRowLp.setMargins(0, dp(4), 0, dp(8));
+                  themeRow.setLayoutParams(themeRowLp);
+
+                  TextView themeLabel = new TextView(ctx);
+                  themeLabel.setText(isDarkMode ? "Theme: Dark Mode" : "Theme: Light Mode");
+                  themeLabel.setTextColor(colorTextMain);
+                  themeLabel.setTextSize(14);
+                  themeLabel.setTypeface(null, Typeface.BOLD);
+                  themeLabel.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1f));
+                  themeRow.addView(themeLabel);
+
+                  final Switch themeSwitch = new Switch(ctx);
+                  themeSwitch.setChecked(isDarkMode);
+                  themeSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+                      if (isChecked == isDarkMode) return;
+                      isDarkMode = isChecked;
+                      prefs.edit().putBoolean("darkMode", isDarkMode).apply();
+                      if (dlgRef[0] != null) dlgRef[0].dismiss();
+                      rebuildUiForTheme();
+                      Toast.makeText(ctx, isDarkMode ? "Dark Mode Enabled" : "Light Mode Enabled", Toast.LENGTH_SHORT).show();
+                      showSettingsDialog();
+                  });
+                  themeRow.setOnClickListener(v -> themeSwitch.toggle());
+                  themeRow.addView(themeSwitch);
+                  innerLayout.addView(themeRow);
+
+                  Button btnSleep = createDialogMenuButton("Sleep Timer", colorChip, colorCardPressed, colorBorder, colorTextMain);
                   btnSleep.setOnClickListener(v -> {
                       final String[] options = {"Turn Off", "15 Minutes", "30 Minutes", "1 Hour", "2 Hours", "3 Hours"};
                       final int[] values = {0, 15, 30, 60, 120, 180};
-                      darkDialog()
+                      themedDialog()
                               .setTitle("Set Sleep Timer")
                               .setItems(options, (d, w) -> MediaPlaybackService.setSleepTimer(ctx, values[w]))
                               .show();
                   });
                   innerLayout.addView(btnSleep);
 
-                  Button btnTrash = createDialogMenuButton(
+                  final Button btnTrash = createDialogMenuButton(
                           showTrashOnly ? "Trash Bin (Active)" : "Trash Bin",
-                          showTrashOnly ? COLOR_PRIMARY : COLOR_CHIP, COLOR_CARD_PRESSED, COLOR_BORDER);
+                          showTrashOnly ? colorPrimary : colorChip,
+                          showTrashOnly ? colorPrimaryDark : colorCardPressed,
+                          showTrashOnly ? colorAccent : colorBorder,
+                          showTrashOnly ? Color.WHITE : colorTextMain);
                   btnTrash.setOnClickListener(v -> {
                       showTrashOnly = !showTrashOnly;
                       if (showTrashOnly) {
@@ -3478,19 +3836,25 @@ jobs:
                       } else {
                           Toast.makeText(ctx, "Showing All Files", Toast.LENGTH_SHORT).show();
                       }
+                      btnTrash.setText(showTrashOnly ? "Trash Bin (Active)" : "Trash Bin");
+                      btnTrash.setBackground(makeButtonDrawable(
+                              showTrashOnly ? colorPrimary : colorChip,
+                              showTrashOnly ? colorPrimaryDark : colorCardPressed,
+                              showTrashOnly ? colorAccent : colorBorder, 12));
+                      btnTrash.setTextColor(showTrashOnly ? Color.WHITE : colorTextMain);
                       refreshListView();
                   });
                   innerLayout.addView(btnTrash);
 
-                  Button btnEqPresets = createDialogMenuButton("EQ Presets", COLOR_CHIP, COLOR_CARD_PRESSED, COLOR_BORDER);
+                  Button btnEqPresets = createDialogMenuButton("EQ Presets", colorChip, colorCardPressed, colorBorder, colorTextMain);
                   btnEqPresets.setOnClickListener(v -> showEqPresets());
                   innerLayout.addView(btnEqPresets);
 
-                  Button btnVolumeBoost = createDialogMenuButton("Volume Boost", COLOR_CHIP, COLOR_CARD_PRESSED, COLOR_BORDER);
+                  Button btnVolumeBoost = createDialogMenuButton("Volume Boost", colorChip, colorCardPressed, colorBorder, colorTextMain);
                   btnVolumeBoost.setOnClickListener(v -> {
                       final String[] options = {"Normal (Off)", "Boost 50%", "Boost 100%", "Boost 150%"};
                       final int[] values = {0, 5, 10, 15};
-                      darkDialog()
+                      themedDialog()
                               .setTitle("Volume Boost")
                               .setItems(options, (d, w) -> {
                                   MediaPlaybackService.volumeBoostLevel = values[w];
@@ -3502,7 +3866,7 @@ jobs:
                   });
                   innerLayout.addView(btnVolumeBoost);
 
-                  final Button btnSkipTime = createDialogMenuButton(getSkipText(), COLOR_CHIP, COLOR_CARD_PRESSED, COLOR_BORDER);
+                  final Button btnSkipTime = createDialogMenuButton(getSkipText(), colorChip, colorCardPressed, colorBorder, colorTextMain);
                   btnSkipTime.setOnClickListener(v -> {
                       int sd = MediaPlaybackService.skipDuration;
                       if (sd == 5000) sd = 10000;
@@ -3527,7 +3891,7 @@ jobs:
 
                   final CheckBox chkSingleLoop = new CheckBox(ctx);
                   chkSingleLoop.setText("Repeat Current Track");
-                  chkSingleLoop.setTextColor(COLOR_TEXT_MAIN);
+                  chkSingleLoop.setTextColor(colorTextMain);
                   chkSingleLoop.setTextSize(14);
                   chkSingleLoop.setChecked(MediaPlaybackService.singleLoop);
                   chkSingleLoop.setPadding(dp(8), dp(10), dp(8), dp(10));
@@ -3539,35 +3903,36 @@ jobs:
                   });
                   innerLayout.addView(chkSingleLoop);
 
-                  Button btnContact = createDialogMenuButton("Contact Developer on WhatsApp", COLOR_CHIP, COLOR_CARD_PRESSED, COLOR_BORDER);
+                  Button btnContact = createDialogMenuButton("Contact Developer on WhatsApp", colorChip, colorCardPressed, colorBorder, colorTextMain);
                   btnContact.setOnClickListener(v -> openLink("https://wa.me/923041011727"));
                   innerLayout.addView(btnContact);
 
-                  Button btnChannel = createDialogMenuButton("Join WhatsApp Channel", COLOR_CHIP, COLOR_CARD_PRESSED, COLOR_BORDER);
+                  Button btnChannel = createDialogMenuButton("Join WhatsApp Channel", colorChip, colorCardPressed, colorBorder, colorTextMain);
                   btnChannel.setOnClickListener(v -> openLink("https://whatsapp.com/channel/0029Vb5y8QCEwEk1OkHev10x"));
                   innerLayout.addView(btnChannel);
 
-                  Button btnFeedback = createDialogMenuButton("Send Feedback", COLOR_CHIP, COLOR_CARD_PRESSED, COLOR_BORDER);
+                  Button btnFeedback = createDialogMenuButton("Send Feedback", colorChip, colorCardPressed, colorBorder, colorTextMain);
                   btnFeedback.setOnClickListener(v -> openFeedbackDialog());
                   innerLayout.addView(btnFeedback);
 
-                  Button btnCheckUpdate = createDialogMenuButton("Check for Updates", COLOR_PRIMARY, COLOR_PRIMARY_DARK, COLOR_CYAN);
+                  Button btnCheckUpdate = createDialogMenuButton("Check for Updates", colorPrimary, colorPrimaryDark, colorAccent, Color.WHITE);
                   btnCheckUpdate.setOnClickListener(v -> checkForUpdates(true));
                   innerLayout.addView(btnCheckUpdate);
 
-                  Button btnAbout = createDialogMenuButton("About & Support", COLOR_CHIP, COLOR_CARD_PRESSED, COLOR_BORDER);
-                  btnAbout.setOnClickListener(v -> darkDialog()
+                  Button btnAbout = createDialogMenuButton("About & Support", colorChip, colorCardPressed, colorBorder, colorTextMain);
+                  btnAbout.setOnClickListener(v -> themedDialog()
                           .setTitle("About & Support")
                           .setMessage("App Name: MJ Audio Player\nVersion: " + UpdateConfig.VERSION_NAME
                                   + " (Build " + UpdateConfig.BUILD_NUMBER + ")"
-                                  + "\nDeveloper: Jahbaz hijbani\n\nFeatures:\n- Modern Dark Mode UI\n- Audio Speed & 28 Voice FX\n- Smart Folder System\n- Background Play\n- Auto Update via GitHub Releases")
+                                  + "\nDeveloper: Jahbaz hijbani\n\nFeatures:\n- Dark & Light Mode Theme\n- Audio Speed & 28 Voice FX\n- Smart Folder System\n- Full Lock Screen & Notification Controls\n- Internal & SD Card Browser\n- Auto Update via GitHub Releases")
                           .setPositiveButton("OK", null)
                           .show());
                   innerLayout.addView(btnAbout);
 
-                  settingsDialog.setView(layout);
-                  settingsDialog.setNegativeButton("Close", null);
-                  settingsDialog.show();
+                  settingsBuilder.setView(layout);
+                  settingsBuilder.setNegativeButton("Close", null);
+                  dlgRef[0] = settingsBuilder.create();
+                  dlgRef[0].show();
               }
           }
           EOF
@@ -3636,7 +4001,7 @@ jobs:
             ### MJ Audio Player v${{ env.APP_VERSION_NAME }} (Build ${{ github.run_number }})
             - **Developer:** Jahbaz Hijbani
             - **Package:** `com.mjaudio.player`
-            - **What's New:** Modern Dark Mode UI, Clean Card List/Grid Design, Active Track Highlight, Pill Controls, Dark Dialogs
+            - **What's New:** Fixed Lock Screen & Notification Controls (Prev, Rewind, Play/Pause, Forward, Next, Close), 4-Layer SD Card Detection, Encrypted Feedback Secrets, Dark & Light Mode
             - **Core Features:** Auto Update Checker, Foreground Media Service, Custom App Icon, 28 Voice FX, Custom 5-Band EQ, A-B Repeat, Sleep Timer
           files: MJ-Audio-Player-v${{ env.APP_VERSION_NAME }}-Release.apk
         env:

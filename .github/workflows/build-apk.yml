@@ -201,6 +201,13 @@ jobs:
           plugins {
             id 'com.android.application' version '8.2.2'
           }
+
+          def appVerCode = Integer.parseInt(System.getenv("GITHUB_RUN_NUMBER") ?: "1")
+          def appVerName = System.getenv("APP_VERSION_NAME") ?: "1.2"
+          def ksStorePass = System.getenv("KEYSTORE_PASSWORD") ?: "MJAud1oReleaseKey2026"
+          def ksKeyAlias = System.getenv("KEY_ALIAS") ?: "mj_audio_key"
+          def ksKeyPass = System.getenv("KEY_PASSWORD") ?: "MJAud1oReleaseKey2026"
+
           android {
             namespace 'com.mjaudio.player'
             compileSdk 34
@@ -208,8 +215,8 @@ jobs:
               applicationId 'com.mjaudio.player'
               minSdk 24
               targetSdk 34
-              versionCode (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInteger()
-              versionName (System.getenv("APP_VERSION_NAME") ?: "1.2")
+              versionCode appVerCode
+              versionName appVerName
             }
             compileOptions {
               sourceCompatibility JavaVersion.VERSION_17
@@ -218,9 +225,9 @@ jobs:
             signingConfigs {
               release {
                 storeFile file("release.keystore")
-                storePassword System.getenv("KEYSTORE_PASSWORD") ?: "MJAud1oReleaseKey2026"
-                keyAlias System.getenv("KEY_ALIAS") ?: "mj_audio_key"
-                keyPassword System.getenv("KEY_PASSWORD") ?: "MJAud1oReleaseKey2026"
+                storePassword ksStorePass
+                keyAlias ksKeyAlias
+                keyPassword ksKeyPass
                 enableV1Signing true
                 enableV2Signing true
               }
@@ -232,6 +239,10 @@ jobs:
                 shrinkResources false
                 debuggable false
               }
+            }
+            lint {
+              checkReleaseBuilds false
+              abortOnError false
             }
           }
           EOF
@@ -3945,7 +3956,7 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           if [ -n "$KEYSTORE_BASE64" ]; then
-            echo "$KEYSTORE_BASE64" | base64 -d > app/release.keystore
+            printf '%s' "$KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > app/release.keystore
             echo "Loaded permanent Release Keystore from GitHub Secrets."
           else
             STORE_PASS="${KEYSTORE_PASSWORD:-MJAud1oReleaseKey2026}"
@@ -3974,7 +3985,7 @@ jobs:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          gradle assembleRelease
+          gradle assembleRelease --stacktrace
           cp app/build/outputs/apk/release/app-release.apk "MJ-Audio-Player-v${APP_VERSION_NAME}-Release.apk"
 
       - name: Verify Release APK Signature

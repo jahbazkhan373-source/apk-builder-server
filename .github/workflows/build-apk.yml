@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  APP_VERSION_NAME: '1.3'
+  APP_VERSION_NAME: '1.4'
 
 jobs:
   build:
@@ -203,7 +203,7 @@ jobs:
           }
 
           def appVerCode = Integer.parseInt(System.getenv("GITHUB_RUN_NUMBER") ?: "1")
-          def appVerName = System.getenv("APP_VERSION_NAME") ?: "1.2"
+          def appVerName = System.getenv("APP_VERSION_NAME") ?: "1.2.1"
           def ksStorePass = System.getenv("KEYSTORE_PASSWORD") ?: "MJAud1oReleaseKey2026"
           def ksKeyAlias = System.getenv("KEY_ALIAS") ?: "mj_audio_key"
           def ksKeyPass = System.getenv("KEY_PASSWORD") ?: "MJAud1oReleaseKey2026"
@@ -230,6 +230,7 @@ jobs:
                 keyPassword ksKeyPass
                 enableV1Signing true
                 enableV2Signing true
+                enableV3Signing true
               }
             }
             buildTypes {
@@ -262,7 +263,8 @@ jobs:
 
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+            android:installLocation="auto">
             <uses-permission android:name="android.permission.INTERNET" />
             <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
             <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
@@ -281,6 +283,17 @@ jobs:
             <uses-permission android:name="android.permission.BLUETOOTH" />
             <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
             <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+            <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
+
+            <queries>
+              <package android:name="com.whatsapp" />
+              <package android:name="com.whatsapp.w4b" />
+              <intent>
+                <action android:name="android.intent.action.VIEW" />
+                <data android:scheme="https" />
+              </intent>
+            </queries>
 
             <application
               android:label="MJ Audio Player"
@@ -308,6 +321,12 @@ jobs:
               <receiver
                 android:name=".MediaControlReceiver"
                 android:exported="false" />
+
+              <provider
+                android:name=".ApkFileProvider"
+                android:authorities="com.mjaudio.player.apkprovider"
+                android:exported="false"
+                android:grantUriPermissions="true" />
             </application>
           </manifest>
           EOF
@@ -318,8 +337,94 @@ jobs:
           public class UpdateConfig {
               public static final String GITHUB_REPO = "${GITHUB_REPOSITORY}";
               public static final String VERSION_NAME = "${APP_VERSION_NAME}";
-              public static final int BUILD_NUMBER = ${GITHUB_RUN_NUMBER};
-              public static final String CURRENT_TAG = "v${APP_VERSION_NAME}-build-${GITHUB_RUN_NUMBER}";
+          }
+          EOF
+
+          cat > app/src/main/java/com/mjaudio/player/ApkFileProvider.java <<'EOF'
+          package com.mjaudio.player;
+
+          import android.content.ContentProvider;
+          import android.content.ContentValues;
+          import android.content.Context;
+          import android.database.Cursor;
+          import android.database.MatrixCursor;
+          import android.net.Uri;
+          import android.os.ParcelFileDescriptor;
+          import android.provider.OpenableColumns;
+
+          import java.io.File;
+          import java.io.FileNotFoundException;
+
+          public class ApkFileProvider extends ContentProvider {
+
+              public static final String AUTHORITY = "com.mjaudio.player.apkprovider";
+              public static final String UPDATE_FILE_NAME = "mj_update.apk";
+
+              public static File getUpdateFile(Context ctx) {
+                  File dir = ctx.getExternalCacheDir();
+                  if (dir == null) dir = ctx.getCacheDir();
+                  if (dir != null && !dir.exists()) dir.mkdirs();
+                  return new File(dir, UPDATE_FILE_NAME);
+              }
+
+              public static Uri getUpdateUri() {
+                  return Uri.parse("content://" + AUTHORITY + "/" + UPDATE_FILE_NAME);
+              }
+
+              @Override
+              public boolean onCreate() {
+                  return true;
+              }
+
+              @Override
+              public String getType(Uri uri) {
+                  return "application/vnd.android.package-archive";
+              }
+
+              @Override
+              public Cursor query(Uri uri, String[] projection, String selection, String[] selectionArgs, String sortOrder) {
+                  Context ctx = getContext();
+                  if (ctx == null) return null;
+                  File file = getUpdateFile(ctx);
+                  if (projection == null) {
+                      projection = new String[]{OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE};
+                  }
+                  MatrixCursor cursor = new MatrixCursor(projection, 1);
+                  Object[] row = new Object[projection.length];
+                  for (int i = 0; i < projection.length; i++) {
+                      if (OpenableColumns.DISPLAY_NAME.equals(projection[i])) {
+                          row[i] = UPDATE_FILE_NAME;
+                      } else if (OpenableColumns.SIZE.equals(projection[i])) {
+                          row[i] = file.exists() ? file.length() : 0L;
+                      }
+                  }
+                  cursor.addRow(row);
+                  return cursor;
+              }
+
+              @Override
+              public ParcelFileDescriptor openFile(Uri uri, String mode) throws FileNotFoundException {
+                  Context ctx = getContext();
+                  if (ctx == null) throw new FileNotFoundException("Context unavailable");
+                  File file = getUpdateFile(ctx);
+                  if (!file.exists()) throw new FileNotFoundException("Update APK not found");
+                  return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY);
+              }
+
+              @Override
+              public Uri insert(Uri uri, ContentValues values) {
+                  return null;
+              }
+
+              @Override
+              public int delete(Uri uri, String selection, String[] selectionArgs) {
+                  return 0;
+              }
+
+              @Override
+              public int update(Uri uri, ContentValues values, String selection, String[] selectionArgs) {
+                  return 0;
+              }
           }
           EOF
 
@@ -426,7 +531,13 @@ jobs:
               public static List<AudioItem> displayList = new ArrayList<>();
               public static int currentIndex = -1;
               public static boolean isPlaying = false;
+              public static boolean isPlayerPrepared = false;
               public static String lastStatusText = "No Audio Selected";
+
+              // Exact seek tracking (keeps slider & audio 100% synced in both Play and Pause states)
+              public static volatile int pausedSeekPos = -1;
+              public static volatile int pendingSeekPos = -1;
+              private static volatile long pendingSeekUntil = 0L;
 
               public static int skipDuration = 10000;
               public static boolean backgroundPlay = true;
@@ -448,6 +559,8 @@ jobs:
 
               private final Handler bgTickHandler = new Handler(Looper.getMainLooper());
               private Runnable bgTickRunnable;
+              private boolean isBgTickRunning = false;
+              private long lastPosSaveTime = 0L;
               private BroadcastReceiver noisyReceiver;
               private AudioManager.OnAudioFocusChangeListener focusChangeListener;
 
@@ -460,7 +573,10 @@ jobs:
                   ensureMediaSession(this);
                   setupAudioFocus();
                   registerNoisyReceiver();
-                  startBackgroundTick();
+                  initBackgroundTick();
+                  if (isPlaying) {
+                      ensureBgTickRunning();
+                  }
               }
 
               @Override
@@ -481,6 +597,7 @@ jobs:
                   Notification notif = buildNotification(this, item, isPlaying);
                   if (isPlaying) {
                       startForegroundCompat(notif);
+                      ensureBgTickRunning();
                   } else if (intent != null && ACTION_START_PLAYBACK.equals(intent.getAction())) {
                       startForegroundCompat(notif);
                       stopForeground(Service.STOP_FOREGROUND_DETACH);
@@ -504,9 +621,7 @@ jobs:
               @Override
               public void onDestroy() {
                   super.onDestroy();
-                  if (bgTickRunnable != null) {
-                      bgTickHandler.removeCallbacks(bgTickRunnable);
-                  }
+                  stopBgTick();
                   try {
                       if (noisyReceiver != null) {
                           unregisterReceiver(noisyReceiver);
@@ -553,28 +668,80 @@ jobs:
                   } catch (Throwable ignored) {}
               }
 
-              private void startBackgroundTick() {
+              private void initBackgroundTick() {
                   bgTickRunnable = new Runnable() {
                       @Override
                       public void run() {
+                          if (!isPlaying || mediaPlayer == null) {
+                              isBgTickRunning = false;
+                              return;
+                          }
                           try {
-                              if (mediaPlayer != null && mediaPlayer.isPlaying()) {
+                              if (mediaPlayer.isPlaying()) {
                                   int current = mediaPlayer.getCurrentPosition();
                                   if (abRepeatState == 2 && current >= abPointB) {
-                                      mediaPlayer.seekTo(abPointA);
+                                      seekCompat(mediaPlayer, abPointA);
                                       current = abPointA;
                                   }
-                                  AudioItem item = getCurrentItem();
-                                  if (item != null) {
-                                      getPrefs(MediaPlaybackService.this).edit()
-                                              .putInt("pos_" + item.path, current).apply();
+                                  long now = System.currentTimeMillis();
+                                  if (now - lastPosSaveTime >= 5000L) {
+                                      lastPosSaveTime = now;
+                                      AudioItem item = getCurrentItem();
+                                      if (item != null) {
+                                          getPrefs(MediaPlaybackService.this).edit()
+                                                  .putInt("pos_" + item.path, current).apply();
+                                      }
                                   }
                               }
                           } catch (Throwable ignored) {}
-                          bgTickHandler.postDelayed(this, 250);
+                          long delay = (abRepeatState == 2) ? 250L : 1000L;
+                          bgTickHandler.postDelayed(this, delay);
                       }
                   };
-                  bgTickHandler.postDelayed(bgTickRunnable, 250);
+              }
+
+              public void ensureBgTickRunning() {
+                  if (bgTickRunnable == null) initBackgroundTick();
+                  if (!isBgTickRunning) {
+                      isBgTickRunning = true;
+                      bgTickHandler.removeCallbacks(bgTickRunnable);
+                      bgTickHandler.postDelayed(bgTickRunnable, (abRepeatState == 2) ? 250L : 1000L);
+                  }
+              }
+
+              public void stopBgTick() {
+                  isBgTickRunning = false;
+                  if (bgTickRunnable != null) {
+                      bgTickHandler.removeCallbacks(bgTickRunnable);
+                  }
+              }
+
+              public static void seekCompat(MediaPlayer mp, int pos) {
+                  if (mp == null) return;
+                  try {
+                      if (Build.VERSION.SDK_INT >= 26) {
+                          mp.seekTo(pos, MediaPlayer.SEEK_CLOSEST);
+                      } else {
+                          mp.seekTo(pos);
+                      }
+                  } catch (Throwable t) {
+                      try { mp.seekTo(pos); } catch (Throwable ignored) {}
+                  }
+              }
+
+              public static int getEffectivePosition() {
+                  if (!isPlaying && pausedSeekPos >= 0) {
+                      return pausedSeekPos;
+                  }
+                  if (pendingSeekPos >= 0 && System.currentTimeMillis() < pendingSeekUntil) {
+                      return pendingSeekPos;
+                  }
+                  try {
+                      if (mediaPlayer != null && isPlayerPrepared) {
+                          return Math.max(0, mediaPlayer.getCurrentPosition());
+                      }
+                  } catch (Throwable ignored) {}
+                  return 0;
               }
 
               public static void ensureMediaSession(final Context ctx) {
@@ -718,12 +885,24 @@ jobs:
                   final Context appCtx = ctx.getApplicationContext();
                   if (mediaPlayer == null) {
                       mediaPlayer = new MediaPlayer();
+                      isPlayerPrepared = false;
                       try {
                           mediaPlayer.setWakeMode(appCtx, PowerManager.PARTIAL_WAKE_LOCK);
                       } catch (Throwable ignored) {}
                   }
+                  mediaPlayer.setOnSeekCompleteListener(mp -> {
+                      pendingSeekPos = -1;
+                      pendingSeekUntil = 0L;
+                      if (isPlaying) {
+                          applyVoiceAndSpeed();
+                      }
+                      notifyUi();
+                  });
                   mediaPlayer.setOnCompletionListener(mp -> {
                       stopEchoPlayer();
+                      pausedSeekPos = -1;
+                      pendingSeekPos = -1;
+                      pendingSeekUntil = 0L;
                       AudioItem curr = getCurrentItem();
                       if (curr != null) {
                           getPrefs(appCtx).edit().putInt("pos_" + curr.path, 0).apply();
@@ -735,6 +914,7 @@ jobs:
                       } else {
                           isPlaying = false;
                           lastStatusText = "Playback Finished";
+                          if (instance != null) instance.stopBgTick();
                           refreshForegroundNotification(appCtx);
                           notifyUi();
                       }
@@ -760,6 +940,13 @@ jobs:
                   } catch (Throwable ignored) {}
               }
 
+              private static void releaseAudioEffects() {
+                  try { if (globalEq != null) { globalEq.release(); globalEq = null; } } catch (Throwable ignored) {}
+                  try { if (globalBass != null) { globalBass.release(); globalBass = null; } } catch (Throwable ignored) {}
+                  try { if (globalVirt != null) { globalVirt.release(); globalVirt = null; } } catch (Throwable ignored) {}
+                  try { if (globalLoudness != null) { globalLoudness.release(); globalLoudness = null; } } catch (Throwable ignored) {}
+              }
+
               public static void syncEchoPlayer(int delayMs, float vol, float speed, float pitch) {
                   if (delayMs <= 0) {
                       stopEchoPlayer();
@@ -779,7 +966,7 @@ jobs:
                       echoPlayer.setLooping(singleLoop);
                       echoPlayer.setVolume(vol, vol);
                       int targetPos = Math.max(0, mediaPlayer.getCurrentPosition() - delayMs);
-                      echoPlayer.seekTo(targetPos);
+                      seekCompat(echoPlayer, targetPos);
                       if (!echoPlayer.isPlaying()) {
                           echoPlayer.start();
                       }
@@ -894,6 +1081,25 @@ jobs:
                   } catch (Throwable ignored) {}
               }
 
+              private static void startWithPendingSeek() {
+                  if (mediaPlayer == null) return;
+                  if (pausedSeekPos >= 0) {
+                      int target = pausedSeekPos;
+                      pausedSeekPos = -1;
+                      pendingSeekPos = target;
+                      pendingSeekUntil = System.currentTimeMillis() + 900L;
+                      seekCompat(mediaPlayer, target);
+                      mediaPlayer.start();
+                      try {
+                          if (Math.abs(mediaPlayer.getCurrentPosition() - target) > 1200) {
+                              seekCompat(mediaPlayer, target);
+                          }
+                      } catch (Throwable ignored) {}
+                  } else {
+                      mediaPlayer.start();
+                  }
+              }
+
               public static void playAudioAtIndex(Context ctx, int index) {
                   Context appCtx = ctx.getApplicationContext();
                   if (index < 0 || index >= displayList.size()) return;
@@ -902,18 +1108,19 @@ jobs:
                   SharedPreferences prefs = getPrefs(appCtx);
 
                   AudioItem prev = getCurrentItem();
-                  if (prev != null && mediaPlayer != null) {
+                  if (prev != null && mediaPlayer != null && isPlayerPrepared) {
                       try {
-                          if (isPlaying || mediaPlayer.getCurrentPosition() > 0) {
-                              prefs.edit().putInt("pos_" + prev.path, mediaPlayer.getCurrentPosition()).apply();
+                          int curPos = getEffectivePosition();
+                          if (isPlaying || curPos > 0) {
+                              prefs.edit().putInt("pos_" + prev.path, curPos).apply();
                           }
                       } catch (Throwable ignored) {}
                   }
 
-                  if (index == currentIndex && mediaPlayer != null) {
+                  if (index == currentIndex && mediaPlayer != null && isPlayerPrepared) {
                       try {
                           if (!mediaPlayer.isPlaying()) {
-                              mediaPlayer.start();
+                              startWithPendingSeek();
                               applyVoiceAndSpeed();
                               isPlaying = true;
                               AudioItem curr = getCurrentItem();
@@ -921,6 +1128,7 @@ jobs:
                                   String title = getTagsPrefs(appCtx).getString(curr.path + "_title", curr.name);
                                   lastStatusText = "Playing: " + title;
                               }
+                              if (instance != null) instance.ensureBgTickRunning();
                               refreshForegroundNotification(appCtx);
                               notifyUi();
                           }
@@ -934,19 +1142,22 @@ jobs:
 
                   try {
                       stopEchoPlayer();
-                      try { if (globalEq != null) { globalEq.release(); globalEq = null; } } catch (Throwable ignored) {}
-                      try { if (globalBass != null) { globalBass.release(); globalBass = null; } } catch (Throwable ignored) {}
-                      try { if (globalVirt != null) { globalVirt.release(); globalVirt = null; } } catch (Throwable ignored) {}
-                      try { if (globalLoudness != null) { globalLoudness.release(); globalLoudness = null; } } catch (Throwable ignored) {}
+                      releaseAudioEffects();
+
+                      pausedSeekPos = -1;
+                      pendingSeekPos = -1;
+                      pendingSeekUntil = 0L;
 
                       mediaPlayer.reset();
+                      isPlayerPrepared = false;
                       mediaPlayer.setDataSource(item.path);
                       mediaPlayer.prepare();
+                      isPlayerPrepared = true;
                       mediaPlayer.setLooping(singleLoop);
 
                       int savedPos = prefs.getInt("pos_" + item.path, 0);
                       if (savedPos > 0 && savedPos < (mediaPlayer.getDuration() - 2000)) {
-                          mediaPlayer.seekTo(savedPos);
+                          seekCompat(mediaPlayer, savedPos);
                       }
 
                       mediaPlayer.start();
@@ -961,6 +1172,7 @@ jobs:
                               .apply();
 
                       applyVoiceAndSpeed();
+                      if (instance != null) instance.ensureBgTickRunning();
                       refreshForegroundNotification(appCtx);
                       notifyUi();
                   } catch (Throwable ignored) {}
@@ -991,14 +1203,17 @@ jobs:
                   if (mediaPlayer == null) return;
                   try {
                       if (mediaPlayer.isPlaying()) {
+                          int pausePos = mediaPlayer.getCurrentPosition();
                           mediaPlayer.pause();
                           try { if (echoPlayer != null && echoPlayer.isPlaying()) echoPlayer.pause(); } catch (Throwable ignored) {}
                           isPlaying = false;
+                          pausedSeekPos = pausePos;
+                          if (instance != null) instance.stopBgTick();
                           AudioItem item = getCurrentItem();
                           if (item != null) {
                               String title = getTagsPrefs(appCtx).getString(item.path + "_title", item.name);
                               lastStatusText = "Paused: " + title;
-                              getPrefs(appCtx).edit().putInt("pos_" + item.path, mediaPlayer.getCurrentPosition()).apply();
+                              getPrefs(appCtx).edit().putInt("pos_" + item.path, pausePos).apply();
                           }
                           refreshForegroundNotification(appCtx);
                           notifyUi();
@@ -1012,8 +1227,10 @@ jobs:
                                   displayList.add(new AudioItem(lf.getName(), lastPath, lf.lastModified(), lf.length(), 0));
                                   playAudioAtIndex(appCtx, 0);
                               }
+                          } else if (!isPlayerPrepared) {
+                              playAudioAtIndex(appCtx, currentIndex);
                           } else {
-                              mediaPlayer.start();
+                              startWithPendingSeek();
                               applyVoiceAndSpeed();
                               isPlaying = true;
                               AudioItem item = getCurrentItem();
@@ -1021,6 +1238,7 @@ jobs:
                                   String title = getTagsPrefs(appCtx).getString(item.path + "_title", item.name);
                                   lastStatusText = "Playing: " + title;
                               }
+                              if (instance != null) instance.ensureBgTickRunning();
                               refreshForegroundNotification(appCtx);
                               notifyUi();
                           }
@@ -1031,12 +1249,20 @@ jobs:
               public static void seekToPosition(Context ctx, int newPos) {
                   Context appCtx = ctx.getApplicationContext();
                   try {
-                      if (mediaPlayer == null) return;
+                      if (mediaPlayer == null || !isPlayerPrepared) return;
                       int dur = mediaPlayer.getDuration();
                       if (dur <= 0) return;
                       int clamped = Math.max(0, Math.min(dur, newPos));
-                      mediaPlayer.seekTo(clamped);
-                      if (isPlaying) applyVoiceAndSpeed();
+                      if (!isPlaying) {
+                          pausedSeekPos = clamped;
+                      }
+                      pendingSeekPos = clamped;
+                      pendingSeekUntil = System.currentTimeMillis() + 900L;
+
+                      seekCompat(mediaPlayer, clamped);
+                      if (isPlaying) {
+                          applyVoiceAndSpeed();
+                      }
                       AudioItem item = getCurrentItem();
                       if (item != null) {
                           getPrefs(appCtx).edit().putInt("pos_" + item.path, clamped).apply();
@@ -1048,8 +1274,8 @@ jobs:
 
               public static void seekAndUpdate(Context ctx, int change) {
                   try {
-                      if (mediaPlayer == null) return;
-                      seekToPosition(ctx, mediaPlayer.getCurrentPosition() + change);
+                      if (mediaPlayer == null || !isPlayerPrepared) return;
+                      seekToPosition(ctx, getEffectivePosition() + change);
                   } catch (Throwable ignored) {}
               }
 
@@ -1060,7 +1286,12 @@ jobs:
                           if (mediaPlayer.isPlaying()) mediaPlayer.stop();
                           mediaPlayer.reset();
                       }
+                      isPlayerPrepared = false;
+                      pausedSeekPos = -1;
+                      pendingSeekPos = -1;
+                      pendingSeekUntil = 0L;
                       stopEchoPlayer();
+                      releaseAudioEffects();
                       isPlaying = false;
                       lastStatusText = "Playback Stopped";
                       NotificationManager nm = (NotificationManager) appCtx.getSystemService(Context.NOTIFICATION_SERVICE);
@@ -1069,6 +1300,7 @@ jobs:
                           mediaSession.setActive(false);
                       }
                       if (instance != null) {
+                          instance.stopBgTick();
                           instance.stopForeground(Service.STOP_FOREGROUND_REMOVE);
                           instance.stopSelf();
                       }
@@ -1180,11 +1412,10 @@ jobs:
                           style.setMediaSession(mediaSession.getSessionToken());
 
                           long dur = 0;
-                          long pos = 0;
+                          long pos = getEffectivePosition();
                           try {
-                              if (mediaPlayer != null) {
+                              if (mediaPlayer != null && isPlayerPrepared) {
                                   dur = mediaPlayer.getDuration();
-                                  pos = mediaPlayer.getCurrentPosition();
                               }
                           } catch (Throwable ignored) {}
 
@@ -1231,13 +1462,10 @@ jobs:
 
           import android.app.Activity;
           import android.app.AlertDialog;
-          import android.app.DownloadManager;
           import android.app.ProgressDialog;
-          import android.content.BroadcastReceiver;
           import android.content.ContentResolver;
           import android.content.Context;
           import android.content.Intent;
-          import android.content.IntentFilter;
           import android.content.SharedPreferences;
           import android.content.pm.PackageManager;
           import android.database.Cursor;
@@ -1286,9 +1514,12 @@ jobs:
           import org.json.JSONArray;
           import org.json.JSONObject;
 
+          import java.io.BufferedInputStream;
           import java.io.BufferedReader;
           import java.io.File;
+          import java.io.FileOutputStream;
           import java.io.FileReader;
+          import java.io.InputStream;
           import java.io.InputStreamReader;
           import java.io.OutputStream;
           import java.lang.reflect.Method;
@@ -1365,6 +1596,7 @@ jobs:
                   LinearLayout card;
                   TextView titleText;
                   TextView metaText;
+                  int appliedStyleState = -1; // -1: unset, 0: normal, 1: active
               }
 
               private Context ctx;
@@ -1388,6 +1620,7 @@ jobs:
               private List<AudioItem> audioList = new ArrayList<>();
               private String currentFolderFilter = "ALL";
               private ArrayAdapter<AudioItem> audioAdapter;
+              private Set<String> cachedStorageRoots = new LinkedHashSet<>();
 
               // UI elements
               private TextView fileCountView;
@@ -1414,9 +1647,10 @@ jobs:
               private final Handler updateHandler = new Handler(Looper.getMainLooper());
               private Runnable updateRunnable;
 
-              // In-App Update Download Tracking
-              private long activeUpdateDownloadId = -1L;
-              private BroadcastReceiver downloadCompleteReceiver;
+              // In-App Update State
+              private boolean isUpdateDialogShowing = false;
+              private boolean isDownloadingUpdate = false;
+              private File pendingInstallApkFile = null;
 
               // ==================== THEME & UI DESIGN HELPERS ====================
 
@@ -1656,9 +1890,8 @@ jobs:
                   } catch (Throwable ignored) {}
 
                   buildUI();
-                  registerUpdateDownloadReceiver();
+                  initUiProgressUpdater();
                   MediaPlaybackService.uiListener = this;
-                  startUiProgressUpdater();
                   syncUiWithPlayer();
 
                   scanAudioFiles();
@@ -1666,26 +1899,42 @@ jobs:
               }
 
               @Override
+              protected void onRestart() {
+                  super.onRestart();
+                  if (pendingInstallApkFile == null && !isDownloadingUpdate) {
+                      checkForUpdates(false);
+                  }
+              }
+
+              @Override
               protected void onResume() {
                   super.onResume();
                   MediaPlaybackService.uiListener = this;
+                  startUiProgressUpdater();
                   syncUiWithPlayer();
+
+                  if (pendingInstallApkFile != null && pendingInstallApkFile.exists()) {
+                      if (Build.VERSION.SDK_INT < 26 || getPackageManager().canRequestPackageInstalls()) {
+                          File apk = pendingInstallApkFile;
+                          pendingInstallApkFile = null;
+                          launchApkInstaller(apk);
+                      }
+                  }
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  stopUiProgressUpdater();
               }
 
               @Override
               protected void onDestroy() {
                   super.onDestroy();
-                  if (updateRunnable != null) {
-                      updateHandler.removeCallbacks(updateRunnable);
-                  }
+                  stopUiProgressUpdater();
                   if (MediaPlaybackService.uiListener == this) {
                       MediaPlaybackService.uiListener = null;
                   }
-                  try {
-                      if (downloadCompleteReceiver != null) {
-                          unregisterReceiver(downloadCompleteReceiver);
-                      }
-                  } catch (Throwable ignored) {}
               }
 
               @Override
@@ -1722,9 +1971,11 @@ jobs:
                           btnABRepeat.setTextColor(colorTextMain);
                       }
 
-                      if (MediaPlaybackService.mediaPlayer != null && MediaPlaybackService.getCurrentItem() != null) {
+                      if (MediaPlaybackService.mediaPlayer != null
+                              && MediaPlaybackService.isPlayerPrepared
+                              && MediaPlaybackService.getCurrentItem() != null) {
                           int dur = MediaPlaybackService.mediaPlayer.getDuration();
-                          int pos = MediaPlaybackService.mediaPlayer.getCurrentPosition();
+                          int pos = MediaPlaybackService.getEffectivePosition();
                           if (dur > 0) {
                               seekBar.setMax(dur);
                               timeTotal.setText(formatDuration(dur));
@@ -1740,13 +1991,15 @@ jobs:
                   } catch (Throwable ignored) {}
               }
 
-              private void startUiProgressUpdater() {
+              private void initUiProgressUpdater() {
                   updateRunnable = new Runnable() {
                       @Override
                       public void run() {
                           try {
-                              if (MediaPlaybackService.mediaPlayer != null && MediaPlaybackService.mediaPlayer.isPlaying()) {
-                                  int current = MediaPlaybackService.mediaPlayer.getCurrentPosition();
+                              if (MediaPlaybackService.mediaPlayer != null
+                                      && MediaPlaybackService.isPlayerPrepared
+                                      && MediaPlaybackService.isPlaying) {
+                                  int current = MediaPlaybackService.getEffectivePosition();
                                   int dur = MediaPlaybackService.mediaPlayer.getDuration();
                                   if (dur > 0 && seekBar.getMax() != dur) {
                                       seekBar.setMax(dur);
@@ -1758,102 +2011,193 @@ jobs:
                                   }
                               }
                           } catch (Throwable ignored) {}
-                          updateHandler.postDelayed(this, 250);
+                          updateHandler.postDelayed(this, MediaPlaybackService.isPlaying ? 300 : 1000);
                       }
                   };
-                  updateHandler.postDelayed(updateRunnable, 250);
               }
 
-              // ==================== GITHUB RELEASES AUTO-UPDATER ====================
-
-              private void registerUpdateDownloadReceiver() {
-                  downloadCompleteReceiver = new BroadcastReceiver() {
-                      @Override
-                      public void onReceive(Context context, Intent intent) {
-                          if (intent == null) return;
-                          long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L);
-                          if (id != -1L && id == activeUpdateDownloadId) {
-                              activeUpdateDownloadId = -1L;
-                              installDownloadedApk(id);
-                          }
-                      }
-                  };
-                  IntentFilter filter = new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE);
-                  try {
-                      if (Build.VERSION.SDK_INT >= 33) {
-                          registerReceiver(downloadCompleteReceiver, filter, Context.RECEIVER_EXPORTED);
-                      } else {
-                          registerReceiver(downloadCompleteReceiver, filter);
-                      }
-                  } catch (Throwable ignored) {}
+              private void startUiProgressUpdater() {
+                  if (updateRunnable == null) initUiProgressUpdater();
+                  updateHandler.removeCallbacks(updateRunnable);
+                  updateHandler.postDelayed(updateRunnable, 300);
               }
 
-              private void installDownloadedApk(long downloadId) {
-                  try {
-                      DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
-                      if (dm == null) return;
-                      Uri apkUri = dm.getUriForDownloadedFile(downloadId);
-                      if (apkUri != null) {
-                          Intent installIntent = new Intent(Intent.ACTION_VIEW);
-                          installIntent.setDataAndType(apkUri, "application/vnd.android.package-archive");
-                          installIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
-                          startActivity(installIntent);
-                      } else {
-                          Toast.makeText(ctx, "Download complete! Open Downloads folder to install.", Toast.LENGTH_LONG).show();
-                      }
-                  } catch (Throwable e) {
-                      Toast.makeText(ctx, "Download complete! Tap notification or check Downloads folder to install.", Toast.LENGTH_LONG).show();
+              private void stopUiProgressUpdater() {
+                  if (updateRunnable != null) {
+                      updateHandler.removeCallbacks(updateRunnable);
                   }
               }
 
-              private void startApkDownload(String apkUrl, String fileName) {
+              // ==================== GITHUB RELEASES DIRECT IN-APP AUTO-UPDATER ====================
+
+              private void launchApkInstaller(File apkFile) {
                   try {
-                      DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
-                      if (dm == null) {
-                          openLink(apkUrl);
+                      if (apkFile == null || !apkFile.exists()) {
+                          Toast.makeText(ctx, "Update APK not found. Please try again.", Toast.LENGTH_LONG).show();
                           return;
                       }
-                      String safeName = (fileName != null && fileName.endsWith(".apk"))
-                              ? fileName
-                              : "MJ-Audio-Player-Update.apk";
-                      DownloadManager.Request req = new DownloadManager.Request(Uri.parse(apkUrl));
-                      req.setTitle("MJ Audio Player Update");
-                      req.setDescription("Downloading " + safeName);
-                      req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
-                      req.setMimeType("application/vnd.android.package-archive");
-                      req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, safeName);
-                      activeUpdateDownloadId = dm.enqueue(req);
-                      Toast.makeText(ctx, "Downloading update... Check notification bar.", Toast.LENGTH_LONG).show();
+                      Uri apkUri = ApkFileProvider.getUpdateUri();
+                      Intent installIntent = new Intent(Intent.ACTION_VIEW);
+                      installIntent.setDataAndType(apkUri, "application/vnd.android.package-archive");
+                      installIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+                      startActivity(installIntent);
                   } catch (Throwable e) {
-                      openLink(apkUrl);
+                      Toast.makeText(ctx, "Unable to launch installer. Please check install permissions.", Toast.LENGTH_LONG).show();
                   }
               }
 
-              private boolean isNewerRelease(String remoteTag) {
-                  if (remoteTag == null || remoteTag.trim().isEmpty()) return false;
-                  String clean = remoteTag.trim();
-                  if (clean.equalsIgnoreCase(UpdateConfig.CURRENT_TAG)) return false;
-
-                  String remoteVer = clean;
-                  int remoteBuild = -1;
-                  Matcher mBuild = Pattern.compile("(?i)-build-(\\d+)").matcher(clean);
-                  if (mBuild.find()) {
+              private void triggerApkInstall(File apkFile) {
+                  if (Build.VERSION.SDK_INT >= 26) {
                       try {
-                          remoteBuild = Integer.parseInt(mBuild.group(1));
+                          if (!getPackageManager().canRequestPackageInstalls()) {
+                              pendingInstallApkFile = apkFile;
+                              Toast.makeText(ctx, "Allow 'Install unknown apps' for MJ Audio Player to install update.", Toast.LENGTH_LONG).show();
+                              Intent permIntent = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES);
+                              permIntent.setData(Uri.parse("package:" + getPackageName()));
+                              startActivity(permIntent);
+                              return;
+                          }
                       } catch (Throwable ignored) {}
-                      remoteVer = clean.substring(0, mBuild.start());
                   }
-                  remoteVer = remoteVer.replaceAll("^[vV]", "").trim();
-                  String localVer = UpdateConfig.VERSION_NAME.replaceAll("^[vV]", "").trim();
+                  launchApkInstaller(apkFile);
+              }
 
-                  int verCmp = compareVersions(remoteVer, localVer);
-                  if (verCmp > 0) return true;
-                  if (verCmp < 0) return false;
-
-                  if (remoteBuild > 0) {
-                      return remoteBuild > UpdateConfig.BUILD_NUMBER;
+              private void startInAppUpdateDownload(final String apkUrl, final String latestVersionName) {
+                  if (isDownloadingUpdate) return;
+                  if (apkUrl == null || apkUrl.trim().isEmpty()) {
+                      Toast.makeText(ctx, "Update APK not available in release.", Toast.LENGTH_LONG).show();
+                      return;
                   }
-                  return false;
+                  isDownloadingUpdate = true;
+
+                  final ProgressDialog pd = new ProgressDialog(ctx, getDialogThemeRes());
+                  pd.setTitle("Updating MJ Audio Player");
+                  pd.setMessage("Downloading version " + latestVersionName + "...");
+                  pd.setProgressStyle(ProgressDialog.STYLE_HORIZONTAL);
+                  pd.setIndeterminate(false);
+                  pd.setMax(100);
+                  pd.setProgress(0);
+                  pd.setCancelable(false);
+                  pd.show();
+
+                  new Thread(() -> {
+                      File outFile = ApkFileProvider.getUpdateFile(ctx);
+                      boolean success = false;
+                      String errMsg = "Download failed. Please check internet connection.";
+                      HttpURLConnection conn = null;
+
+                      try {
+                          if (outFile.exists()) outFile.delete();
+
+                          String currentUrl = apkUrl;
+                          int redirects = 0;
+                          while (redirects < 8) {
+                              URL url = new URL(currentUrl);
+                              conn = (HttpURLConnection) url.openConnection();
+                              conn.setInstanceFollowRedirects(false);
+                              conn.setConnectTimeout(20000);
+                              conn.setReadTimeout(30000);
+                              conn.setRequestProperty("User-Agent", "MJ-Audio-Player-Android");
+
+                              int code = conn.getResponseCode();
+                              if (code == HttpURLConnection.HTTP_MOVED_PERM
+                                      || code == HttpURLConnection.HTTP_MOVED_TEMP
+                                      || code == HttpURLConnection.HTTP_SEE_OTHER
+                                      || code == 307 || code == 308) {
+                                  String loc = conn.getHeaderField("Location");
+                                  conn.disconnect();
+                                  if (loc == null || loc.isEmpty()) break;
+                                  currentUrl = new URL(url, loc).toString();
+                                  redirects++;
+                              } else {
+                                  break;
+                              }
+                          }
+
+                          if (conn != null && conn.getResponseCode() == HttpURLConnection.HTTP_OK) {
+                              long totalBytes = conn.getContentLengthLong();
+                              if (totalBytes <= 0) {
+                                  runOnUiThread(() -> pd.setIndeterminate(true));
+                              }
+
+                              try (InputStream is = new BufferedInputStream(conn.getInputStream());
+                                   FileOutputStream fos = new FileOutputStream(outFile)) {
+                                  byte[] buffer = new byte[16384];
+                                  long downloaded = 0;
+                                  int read;
+                                  int lastPct = -1;
+                                  while ((read = is.read(buffer)) != -1) {
+                                      fos.write(buffer, 0, read);
+                                      downloaded += read;
+                                      if (totalBytes > 0) {
+                                          final int pct = (int) ((downloaded * 100L) / totalBytes);
+                                          if (pct != lastPct) {
+                                              lastPct = pct;
+                                              runOnUiThread(() -> pd.setProgress(pct));
+                                          }
+                                      }
+                                  }
+                                  fos.flush();
+                              }
+
+                              if (outFile.exists() && outFile.length() > 10000L) {
+                                  success = true;
+                              } else {
+                                  errMsg = "Downloaded APK file is incomplete.";
+                              }
+                          } else if (conn != null) {
+                              errMsg = "Download error: HTTP " + conn.getResponseCode();
+                          }
+                      } catch (Throwable e) {
+                          errMsg = "Download failed: " + (e.getMessage() != null ? e.getMessage() : "Network error");
+                      } finally {
+                          if (conn != null) {
+                              try { conn.disconnect(); } catch (Throwable ignored) {}
+                          }
+                      }
+
+                      final boolean finalSuccess = success;
+                      final String finalErr = errMsg;
+                      runOnUiThread(() -> {
+                          isDownloadingUpdate = false;
+                          try { pd.dismiss(); } catch (Throwable ignored) {}
+                          if (finalSuccess) {
+                              triggerApkInstall(outFile);
+                          } else {
+                              Toast.makeText(ctx, finalErr, Toast.LENGTH_LONG).show();
+                          }
+                      });
+                  }).start();
+              }
+
+              private String extractDottedVersion(String text) {
+                  if (text == null || text.isEmpty()) return null;
+                  Matcher m = Pattern.compile("(\\d+\\.\\d+(?:\\.\\d+)*)").matcher(text);
+                  if (m.find()) {
+                      return m.group(1);
+                  }
+                  return null;
+              }
+
+              private String resolveCleanVersionName(String tagName, String releaseName, String apkName) {
+                  String v = extractDottedVersion(tagName);
+                  if (v != null) return v;
+                  v = extractDottedVersion(releaseName);
+                  if (v != null) return v;
+                  v = extractDottedVersion(apkName);
+                  if (v != null) return v;
+                  if (tagName != null) {
+                      String cleaned = tagName.replaceAll("(?i)-build-\\d+", "").replaceAll("^[vV]", "").trim();
+                      if (!cleaned.isEmpty()) return cleaned;
+                  }
+                  return UpdateConfig.VERSION_NAME;
+              }
+
+              private boolean isNewerVersion(String remoteVersionName, String localVersionName) {
+                  if (remoteVersionName == null || remoteVersionName.trim().isEmpty()) return false;
+                  String rClean = remoteVersionName.replaceAll("^[vV]", "").trim();
+                  String lClean = localVersionName.replaceAll("^[vV]", "").trim();
+                  return compareVersions(rClean, lClean) > 0;
               }
 
               private int compareVersions(String v1, String v2) {
@@ -1884,6 +2228,9 @@ jobs:
                       if (isManual) {
                           Toast.makeText(ctx, "Update repository not configured.", Toast.LENGTH_SHORT).show();
                       }
+                      return;
+                  }
+                  if (!isManual && (isUpdateDialogShowing || isDownloadingUpdate)) {
                       return;
                   }
 
@@ -1936,13 +2283,11 @@ jobs:
                               try {
                                   JSONObject json = new JSONObject(finalBody);
                                   final String tagName = json.optString("tag_name", "");
-                                  final String releaseName = json.optString("name", tagName);
+                                  final String releaseName = json.optString("name", "");
                                   final String notes = json.optString("body", "Bug fixes and improvements.");
-                                  final String htmlUrl = json.optString("html_url",
-                                          "https://github.com/" + UpdateConfig.GITHUB_REPO + "/releases");
 
                                   String foundApkUrl = null;
-                                  String foundApkName = "MJ-Audio-Player-" + tagName + ".apk";
+                                  String foundApkName = "";
                                   JSONArray assets = json.optJSONArray("assets");
                                   if (assets != null) {
                                       for (int i = 0; i < assets.length(); i++) {
@@ -1958,33 +2303,30 @@ jobs:
                                       }
                                   }
 
-                                  if (isNewerRelease(tagName)) {
+                                  final String latestVersionName = resolveCleanVersionName(tagName, releaseName, foundApkName);
+
+                                  if (isNewerVersion(latestVersionName, UpdateConfig.VERSION_NAME)) {
                                       final String downloadUrl = foundApkUrl;
-                                      final String apkFileName = foundApkName;
-                                      String msg = "Installed: v" + UpdateConfig.VERSION_NAME
-                                              + " (Build " + UpdateConfig.BUILD_NUMBER + ")"
-                                              + "\nLatest: " + releaseName
+                                      String msg = "Installed Version: " + UpdateConfig.VERSION_NAME
+                                              + "\nLatest Version: " + latestVersionName
                                               + "\n\nWhat's New:\n" + notes;
 
-                                      AlertDialog.Builder builder = themedDialog()
-                                              .setTitle("New Update Available!")
-                                              .setMessage(msg)
-                                              .setNegativeButton("Later", null);
-
-                                      if (downloadUrl != null && !downloadUrl.isEmpty()) {
-                                          builder.setPositiveButton("Download APK", (d, w) -> startApkDownload(downloadUrl, apkFileName));
-                                          builder.setNeutralButton("Open in Browser", (d, w) -> openLink(downloadUrl));
-                                      } else {
-                                          builder.setPositiveButton("Open Release Page", (d, w) -> openLink(htmlUrl));
-                                      }
-                                      if (!isFinishing()) {
-                                          builder.show();
+                                      if (!isFinishing() && !isUpdateDialogShowing) {
+                                          isUpdateDialogShowing = true;
+                                          AlertDialog dlg = themedDialog()
+                                                  .setTitle("New Update Available!")
+                                                  .setMessage(msg)
+                                                  .setPositiveButton("UPDATE", (d, w) -> startInAppUpdateDownload(downloadUrl, latestVersionName))
+                                                  .setNegativeButton("Later", null)
+                                                  .create();
+                                          dlg.setOnDismissListener(d -> isUpdateDialogShowing = false);
+                                          dlg.show();
                                       }
                                   } else if (isManual) {
                                       themedDialog()
                                               .setTitle("Up to Date")
-                                              .setMessage("You already have the latest version.\n\nCurrent: v"
-                                                      + UpdateConfig.VERSION_NAME + " (Build " + UpdateConfig.BUILD_NUMBER + ")")
+                                              .setMessage("You already have the latest version.\n\nCurrent Version: "
+                                                      + UpdateConfig.VERSION_NAME)
                                               .setPositiveButton("OK", null)
                                               .show();
                                   }
@@ -2059,6 +2401,7 @@ jobs:
                   LinearLayout mainLayout = new LinearLayout(ctx);
                   mainLayout.setOrientation(LinearLayout.VERTICAL);
                   mainLayout.setBackgroundColor(colorBg);
+                  mainLayout.setFitsSystemWindows(true);
                   mainLayout.setLayoutParams(new LinearLayout.LayoutParams(-1, -1));
                   mainLayout.setPadding(dp(10), dp(10), dp(10), dp(10));
 
@@ -2444,7 +2787,9 @@ jobs:
                       @Override
                       public void onStopTrackingTouch(SeekBar sb) {
                           isUserSeeking = false;
-                          MediaPlaybackService.seekToPosition(ctx, sb.getProgress());
+                          int target = sb.getProgress();
+                          timeCurrent.setText(formatDuration(target));
+                          MediaPlaybackService.seekToPosition(ctx, target);
                       }
                   });
               }
@@ -2502,6 +2847,21 @@ jobs:
                       intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                       ctx.startActivity(intent);
                   } catch (Throwable ignored) {}
+              }
+
+              private void openWhatsAppLink(String url) {
+                  Uri uri = Uri.parse(url);
+                  String[] waPackages = {"com.whatsapp", "com.whatsapp.w4b"};
+                  for (String pkg : waPackages) {
+                      try {
+                          Intent waIntent = new Intent(Intent.ACTION_VIEW, uri);
+                          waIntent.setPackage(pkg);
+                          waIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          ctx.startActivity(waIntent);
+                          return;
+                      } catch (Throwable ignored) {}
+                  }
+                  openLink(url);
               }
 
               private String formatDuration(long ms) {
@@ -2678,14 +3038,18 @@ jobs:
                           holder.metaText.setText(String.format(Locale.US,
                                   "Size: %.1f MB  •  Time: %s  •  %s", sizeMB, durStr, fileType));
 
-                          if (isCurrent) {
-                              holder.card.setBackground(makeCardDrawable(colorActiveCard, colorPrimary, 12, 1));
-                              holder.titleText.setTextColor(colorAccent);
-                              holder.metaText.setTextColor(colorTextMain);
-                          } else {
-                              holder.card.setBackground(makeCardDrawable(colorCard, colorBorder, 12, 1));
-                              holder.titleText.setTextColor(colorTextMain);
-                              holder.metaText.setTextColor(colorTextSub);
+                          int desiredState = isCurrent ? 1 : 0;
+                          if (holder.appliedStyleState != desiredState) {
+                              holder.appliedStyleState = desiredState;
+                              if (isCurrent) {
+                                  holder.card.setBackground(makeCardDrawable(colorActiveCard, colorPrimary, 12, 1));
+                                  holder.titleText.setTextColor(colorAccent);
+                                  holder.metaText.setTextColor(colorTextMain);
+                              } else {
+                                  holder.card.setBackground(makeCardDrawable(colorCard, colorBorder, 12, 1));
+                                  holder.titleText.setTextColor(colorTextMain);
+                                  holder.metaText.setTextColor(colorTextSub);
+                              }
                           }
 
                           return convertView;
@@ -2749,12 +3113,19 @@ jobs:
                               }
                               if (MediaPlaybackService.mediaPlayer != null
                                       && !MediaPlaybackService.mediaPlayer.isPlaying()
-                                      && lastPos > 0) {
+                                      && !MediaPlaybackService.isPlayerPrepared
+                                      && new File(lastPath).exists()) {
                                   try {
                                       MediaPlaybackService.mediaPlayer.reset();
                                       MediaPlaybackService.mediaPlayer.setDataSource(lastPath);
                                       MediaPlaybackService.mediaPlayer.prepare();
-                                      MediaPlaybackService.mediaPlayer.seekTo(lastPos);
+                                      MediaPlaybackService.isPlayerPrepared = true;
+                                      if (lastPos > 0 && lastPos < MediaPlaybackService.mediaPlayer.getDuration()) {
+                                          MediaPlaybackService.pausedSeekPos = lastPos;
+                                          MediaPlaybackService.seekCompat(MediaPlaybackService.mediaPlayer, lastPos);
+                                      } else {
+                                          MediaPlaybackService.pausedSeekPos = 0;
+                                      }
                                       MediaPlaybackService.lastStatusText = "Paused: " + (!lastName.isEmpty() ? lastName : "Unknown");
                                       syncUiWithPlayer();
                                   } catch (Throwable ignored) {}
@@ -2808,7 +3179,7 @@ jobs:
               }
 
               private void showGoToTimeDialog() {
-                  if (MediaPlaybackService.mediaPlayer == null) return;
+                  if (MediaPlaybackService.mediaPlayer == null || !MediaPlaybackService.isPlayerPrepared) return;
                   LinearLayout wrap = new LinearLayout(ctx);
                   wrap.setPadding(dp(20), dp(12), dp(20), dp(4));
                   EditText input = new EditText(ctx);
@@ -2821,7 +3192,7 @@ jobs:
                           .setView(wrap)
                           .setPositiveButton("Go", (d, w) -> {
                               String timeStr = input.getText().toString().trim();
-                              int millis = 0;
+                              int millis = -1;
                               Matcher m3 = Pattern.compile("(\\d+):(\\d+):(\\d+)").matcher(timeStr);
                               if (m3.find()) {
                                   int h = Integer.parseInt(m3.group(1));
@@ -2837,7 +3208,7 @@ jobs:
                                   }
                               }
 
-                              if (millis > 0) {
+                              if (millis >= 0) {
                                   try {
                                       if (millis <= MediaPlaybackService.mediaPlayer.getDuration()) {
                                           MediaPlaybackService.seekToPosition(ctx, millis);
@@ -2856,14 +3227,14 @@ jobs:
               }
 
               private void handleABRepeat() {
-                  if (MediaPlaybackService.mediaPlayer == null) return;
+                  if (MediaPlaybackService.mediaPlayer == null || !MediaPlaybackService.isPlayerPrepared) return;
                   try {
                       if (MediaPlaybackService.abRepeatState == 0) {
-                          MediaPlaybackService.abPointA = MediaPlaybackService.mediaPlayer.getCurrentPosition();
+                          MediaPlaybackService.abPointA = MediaPlaybackService.getEffectivePosition();
                           MediaPlaybackService.abRepeatState = 1;
                           Toast.makeText(ctx, "Point A set", Toast.LENGTH_SHORT).show();
                       } else if (MediaPlaybackService.abRepeatState == 1) {
-                          MediaPlaybackService.abPointB = MediaPlaybackService.mediaPlayer.getCurrentPosition();
+                          MediaPlaybackService.abPointB = MediaPlaybackService.getEffectivePosition();
                           if (MediaPlaybackService.abPointB > MediaPlaybackService.abPointA) {
                               MediaPlaybackService.abRepeatState = 2;
                               Toast.makeText(ctx, "Point B set. Repeating...", Toast.LENGTH_SHORT).show();
@@ -2945,7 +3316,7 @@ jobs:
                           .show();
               }
 
-              // ==================== 4-LAYER SD CARD DETECTION (ANDROID 7 TO 15) ====================
+              // ==================== 4-LAYER SD CARD DETECTION (ANDROID 7 TO 16) ====================
 
               private Map<String, String> getAvailableStorages() {
                   Map<String, String> storages = new LinkedHashMap<>();
@@ -3057,6 +3428,7 @@ jobs:
                       }
                   } catch (Throwable ignored) {}
 
+                  cachedStorageRoots = new LinkedHashSet<>(storages.keySet());
                   return storages;
               }
 
@@ -3074,8 +3446,7 @@ jobs:
                       return;
                   }
 
-                  Set<String> storageRoots = new LinkedHashSet<>(getAvailableStorages().keySet());
-                  boolean isRoot = storageRoots.contains(dirPath);
+                  boolean isRoot = cachedStorageRoots.contains(dirPath);
 
                   File[] files = null;
                   try { files = f.listFiles(); } catch (Throwable ignored) {}
@@ -3154,10 +3525,10 @@ jobs:
                       } else {
                           if (isAudioFileName(selected.name)) {
                               AudioItem prevItem = MediaPlaybackService.getCurrentItem();
-                              if (prevItem != null && MediaPlaybackService.mediaPlayer != null) {
+                              if (prevItem != null && MediaPlaybackService.mediaPlayer != null && MediaPlaybackService.isPlayerPrepared) {
                                   try {
                                       prefs.edit().putInt("pos_" + prevItem.path,
-                                              MediaPlaybackService.mediaPlayer.getCurrentPosition()).apply();
+                                              MediaPlaybackService.getEffectivePosition()).apply();
                                   } catch (Throwable ignored) {}
                               }
                               List<AudioItem> siblings = new ArrayList<>();
@@ -3290,10 +3661,10 @@ jobs:
 
                   flistView.setOnItemClickListener((parent, view, position, id) -> {
                       AudioItem curr = MediaPlaybackService.getCurrentItem();
-                      if (curr != null && MediaPlaybackService.mediaPlayer != null) {
+                      if (curr != null && MediaPlaybackService.mediaPlayer != null && MediaPlaybackService.isPlayerPrepared) {
                           try {
                               prefs.edit().putInt("pos_" + curr.path,
-                                      MediaPlaybackService.mediaPlayer.getCurrentPosition()).apply();
+                                      MediaPlaybackService.getEffectivePosition()).apply();
                           } catch (Throwable ignored) {}
                       }
                       currentFolderFilter = folderPaths.get(position);
@@ -3915,11 +4286,11 @@ jobs:
                   innerLayout.addView(chkSingleLoop);
 
                   Button btnContact = createDialogMenuButton("Contact Developer on WhatsApp", colorChip, colorCardPressed, colorBorder, colorTextMain);
-                  btnContact.setOnClickListener(v -> openLink("https://wa.me/923041011727"));
+                  btnContact.setOnClickListener(v -> openWhatsAppLink("https://wa.me/923041011727"));
                   innerLayout.addView(btnContact);
 
                   Button btnChannel = createDialogMenuButton("Join WhatsApp Channel", colorChip, colorCardPressed, colorBorder, colorTextMain);
-                  btnChannel.setOnClickListener(v -> openLink("https://whatsapp.com/channel/0029Vb5y8QCEwEk1OkHev10x"));
+                  btnChannel.setOnClickListener(v -> openWhatsAppLink("https://whatsapp.com/channel/0029Vb5y8QCEwEk1OkHev10x"));
                   innerLayout.addView(btnChannel);
 
                   Button btnFeedback = createDialogMenuButton("Send Feedback", colorChip, colorCardPressed, colorBorder, colorTextMain);
@@ -3934,7 +4305,6 @@ jobs:
                   btnAbout.setOnClickListener(v -> themedDialog()
                           .setTitle("About & Support")
                           .setMessage("App Name: MJ Audio Player\nVersion: " + UpdateConfig.VERSION_NAME
-                                  + " (Build " + UpdateConfig.BUILD_NUMBER + ")"
                                   + "\nDeveloper: Jahbaz hijbani\n\nFeatures:\n- Dark & Light Mode Theme\n- Audio Speed & 28 Voice FX\n- Smart Folder System\n- Full Lock Screen & Notification Controls\n- Internal & SD Card Browser\n- Auto Update via GitHub Releases")
                           .setPositiveButton("OK", null)
                           .show());
@@ -3992,7 +4362,7 @@ jobs:
         run: |
           APKSIGNER=$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -name "apksigner" 2>/dev/null | sort -V | tail -n 1)
           if [ -n "$APKSIGNER" ]; then
-            "$APKSIGNER" verify --print-certs "MJ-Audio-Player-v${APP_VERSION_NAME}-Release.apk"
+            "$APKSIGNER" verify --verbose --print-certs "MJ-Audio-Player-v${APP_VERSION_NAME}-Release.apk"
           else
             keytool -printcert -jarfile "MJ-Audio-Player-v${APP_VERSION_NAME}-Release.apk"
           fi
@@ -4006,14 +4376,13 @@ jobs:
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ env.APP_VERSION_NAME }}-build-${{ github.run_number }}
-          name: MJ Audio Player v${{ env.APP_VERSION_NAME }} (Build ${{ github.run_number }})
+          tag_name: v${{ env.APP_VERSION_NAME }}
+          name: MJ Audio Player v${{ env.APP_VERSION_NAME }}
           body: |
-            ### MJ Audio Player v${{ env.APP_VERSION_NAME }} (Build ${{ github.run_number }})
+            ### MJ Audio Player v${{ env.APP_VERSION_NAME }}
             - **Developer:** Jahbaz Hijbani
             - **Package:** `com.mjaudio.player`
-            - **What's New:** Fixed Lock Screen & Notification Controls (Prev, Rewind, Play/Pause, Forward, Next, Close), 4-Layer SD Card Detection, Encrypted Feedback Secrets, Dark & Light Mode
-            - **Core Features:** Auto Update Checker, Foreground Media Service, Custom App Icon, 28 Voice FX, Custom 5-Band EQ, A-B Repeat, Sleep Timer
+            - **What's New:** Fixed Seek/Slider while Paused, Direct In-App Update Download & Install (UPDATE button only), Clean versionName Display, WhatsApp Channel Direct Open, Universal v1/v2/v3 Signed APK & Low Memory Optimization
           files: MJ-Audio-Player-v${{ env.APP_VERSION_NAME }}-Release.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

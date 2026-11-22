@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  APP_VERSION_NAME: '1.4'
+  APP_VERSION_NAME: '1.5'
 
 jobs:
   build:
@@ -203,7 +203,7 @@ jobs:
           }
 
           def appVerCode = Integer.parseInt(System.getenv("GITHUB_RUN_NUMBER") ?: "1")
-          def appVerName = System.getenv("APP_VERSION_NAME") ?: "1.2.1"
+          def appVerName = System.getenv("APP_VERSION_NAME") ?: "1.5"
           def ksStorePass = System.getenv("KEYSTORE_PASSWORD") ?: "MJAud1oReleaseKey2026"
           def ksKeyAlias = System.getenv("KEY_ALIAS") ?: "mj_audio_key"
           def ksKeyPass = System.getenv("KEY_PASSWORD") ?: "MJAud1oReleaseKey2026"
@@ -231,6 +231,7 @@ jobs:
                 enableV1Signing true
                 enableV2Signing true
                 enableV3Signing true
+                enableV4Signing true
               }
             }
             buildTypes {
@@ -534,10 +535,14 @@ jobs:
               public static boolean isPlayerPrepared = false;
               public static String lastStatusText = "No Audio Selected";
 
-              // Exact seek tracking (keeps slider & audio 100% synced in both Play and Pause states)
+              // Bulletproof seek state (keeps slider & audio 100% synced in both Play and Pause states)
               public static volatile int pausedSeekPos = -1;
-              public static volatile int pendingSeekPos = -1;
-              private static volatile long pendingSeekUntil = 0L;
+              public static volatile int lockedSeekPos = -1;
+              public static volatile long seekLockUntil = 0L;
+              private static float lastAppliedSpeed = 1.0f;
+              private static float lastAppliedPitch = 1.0f;
+              private static int lastEchoDelay = 0;
+              private static float lastEchoVol = 0.0f;
 
               public static int skipDuration = 10000;
               public static boolean backgroundPlay = true;
@@ -678,13 +683,13 @@ jobs:
                           }
                           try {
                               if (mediaPlayer.isPlaying()) {
-                                  int current = mediaPlayer.getCurrentPosition();
-                                  if (abRepeatState == 2 && current >= abPointB) {
-                                      seekCompat(mediaPlayer, abPointA);
+                                  int current = getEffectivePosition();
+                                  if (abRepeatState == 2 && current >= abPointB && System.currentTimeMillis() >= seekLockUntil) {
+                                      seekToPosition(MediaPlaybackService.this, abPointA);
                                       current = abPointA;
                                   }
                                   long now = System.currentTimeMillis();
-                                  if (now - lastPosSaveTime >= 5000L) {
+                                  if (now >= seekLockUntil && (now - lastPosSaveTime >= 5000L)) {
                                       lastPosSaveTime = now;
                                       AudioItem item = getCurrentItem();
                                       if (item != null) {
@@ -733,8 +738,8 @@ jobs:
                   if (!isPlaying && pausedSeekPos >= 0) {
                       return pausedSeekPos;
                   }
-                  if (pendingSeekPos >= 0 && System.currentTimeMillis() < pendingSeekUntil) {
-                      return pendingSeekPos;
+                  if (lockedSeekPos >= 0 && System.currentTimeMillis() < seekLockUntil) {
+                      return lockedSeekPos;
                   }
                   try {
                       if (mediaPlayer != null && isPlayerPrepared) {
@@ -891,18 +896,25 @@ jobs:
                       } catch (Throwable ignored) {}
                   }
                   mediaPlayer.setOnSeekCompleteListener(mp -> {
-                      pendingSeekPos = -1;
-                      pendingSeekUntil = 0L;
-                      if (isPlaying) {
-                          applyVoiceAndSpeed();
-                      }
+                      try {
+                          if (isPlaying) {
+                              int actual = mp.getCurrentPosition();
+                              if (lockedSeekPos < 0 || Math.abs(actual - lockedSeekPos) <= 3000) {
+                                  lockedSeekPos = -1;
+                                  seekLockUntil = 0L;
+                              }
+                              if (lastEchoDelay > 0) {
+                                  syncEchoPlayer(lastEchoDelay, lastEchoVol, lastAppliedSpeed, lastAppliedPitch);
+                              }
+                          }
+                      } catch (Throwable ignored) {}
                       notifyUi();
                   });
                   mediaPlayer.setOnCompletionListener(mp -> {
                       stopEchoPlayer();
                       pausedSeekPos = -1;
-                      pendingSeekPos = -1;
-                      pendingSeekUntil = 0L;
+                      lockedSeekPos = -1;
+                      seekLockUntil = 0L;
                       AudioItem curr = getCurrentItem();
                       if (curr != null) {
                           getPrefs(appCtx).edit().putInt("pos_" + curr.path, 0).apply();
@@ -1028,10 +1040,22 @@ jobs:
                           else if ("Battery Low".equals(e)) { targetPitch = 0.72f; speedMultiplier = 0.72f; }
 
                           float finalSpeed = Math.max(0.25f, Math.min(3.0f, currentPlaybackSpeed * speedMultiplier));
-                          PlaybackParams params = mediaPlayer.getPlaybackParams();
-                          params.setSpeed(finalSpeed);
-                          params.setPitch(targetPitch);
-                          mediaPlayer.setPlaybackParams(params);
+                          lastEchoDelay = echoDelay;
+                          lastEchoVol = echoVol;
+
+                          // Only touch PlaybackParams when speed or pitch actually differs (prevents seek resets)
+                          try {
+                              PlaybackParams curParams = mediaPlayer.getPlaybackParams();
+                              float curSpd = curParams.getSpeed();
+                              float curPit = curParams.getPitch();
+                              if (Math.abs(curSpd - finalSpeed) > 0.01f || Math.abs(curPit - targetPitch) > 0.01f) {
+                                  curParams.setSpeed(finalSpeed);
+                                  curParams.setPitch(targetPitch);
+                                  mediaPlayer.setPlaybackParams(curParams);
+                              }
+                          } catch (Throwable ignored) {}
+                          lastAppliedSpeed = finalSpeed;
+                          lastAppliedPitch = targetPitch;
 
                           if (eqBands != null) {
                               try {
@@ -1084,19 +1108,31 @@ jobs:
               private static void startWithPendingSeek() {
                   if (mediaPlayer == null) return;
                   if (pausedSeekPos >= 0) {
-                      int target = pausedSeekPos;
+                      final int target = pausedSeekPos;
                       pausedSeekPos = -1;
-                      pendingSeekPos = target;
-                      pendingSeekUntil = System.currentTimeMillis() + 900L;
+                      lockedSeekPos = target;
+                      seekLockUntil = System.currentTimeMillis() + 1800L;
+
                       seekCompat(mediaPlayer, target);
                       mediaPlayer.start();
-                      try {
-                          if (Math.abs(mediaPlayer.getCurrentPosition() - target) > 1200) {
-                              seekCompat(mediaPlayer, target);
-                          }
-                      } catch (Throwable ignored) {}
+                      isPlaying = true;
+                      applyVoiceAndSpeed();
+
+                      // Hardware decoder safeguard: verify position 150ms after start
+                      mainHandler.postDelayed(() -> {
+                          try {
+                              if (mediaPlayer != null && isPlaying && mediaPlayer.isPlaying()) {
+                                  int cur = mediaPlayer.getCurrentPosition();
+                                  if (Math.abs(cur - target) > 2000) {
+                                      seekCompat(mediaPlayer, target);
+                                  }
+                              }
+                          } catch (Throwable ignored) {}
+                      }, 150L);
                   } else {
                       mediaPlayer.start();
+                      isPlaying = true;
+                      applyVoiceAndSpeed();
                   }
               }
 
@@ -1121,8 +1157,6 @@ jobs:
                       try {
                           if (!mediaPlayer.isPlaying()) {
                               startWithPendingSeek();
-                              applyVoiceAndSpeed();
-                              isPlaying = true;
                               AudioItem curr = getCurrentItem();
                               if (curr != null) {
                                   String title = getTagsPrefs(appCtx).getString(curr.path + "_title", curr.name);
@@ -1145,8 +1179,8 @@ jobs:
                       releaseAudioEffects();
 
                       pausedSeekPos = -1;
-                      pendingSeekPos = -1;
-                      pendingSeekUntil = 0L;
+                      lockedSeekPos = -1;
+                      seekLockUntil = 0L;
 
                       mediaPlayer.reset();
                       isPlayerPrepared = false;
@@ -1157,6 +1191,8 @@ jobs:
 
                       int savedPos = prefs.getInt("pos_" + item.path, 0);
                       if (savedPos > 0 && savedPos < (mediaPlayer.getDuration() - 2000)) {
+                          lockedSeekPos = savedPos;
+                          seekLockUntil = System.currentTimeMillis() + 1500L;
                           seekCompat(mediaPlayer, savedPos);
                       }
 
@@ -1203,11 +1239,13 @@ jobs:
                   if (mediaPlayer == null) return;
                   try {
                       if (mediaPlayer.isPlaying()) {
-                          int pausePos = mediaPlayer.getCurrentPosition();
+                          int pausePos = getEffectivePosition();
                           mediaPlayer.pause();
                           try { if (echoPlayer != null && echoPlayer.isPlaying()) echoPlayer.pause(); } catch (Throwable ignored) {}
                           isPlaying = false;
                           pausedSeekPos = pausePos;
+                          lockedSeekPos = -1;
+                          seekLockUntil = 0L;
                           if (instance != null) instance.stopBgTick();
                           AudioItem item = getCurrentItem();
                           if (item != null) {
@@ -1231,8 +1269,6 @@ jobs:
                               playAudioAtIndex(appCtx, currentIndex);
                           } else {
                               startWithPendingSeek();
-                              applyVoiceAndSpeed();
-                              isPlaying = true;
                               AudioItem item = getCurrentItem();
                               if (item != null) {
                                   String title = getTagsPrefs(appCtx).getString(item.path + "_title", item.name);
@@ -1249,24 +1285,54 @@ jobs:
               public static void seekToPosition(Context ctx, int newPos) {
                   Context appCtx = ctx.getApplicationContext();
                   try {
-                      if (mediaPlayer == null || !isPlayerPrepared) return;
+                      ensureMediaPlayer(appCtx);
+                      if (mediaPlayer == null) return;
+
+                      // If user drags slider while track is selected but not yet prepared, prepare it silently
+                      if (!isPlayerPrepared) {
+                          AudioItem curItem = getCurrentItem();
+                          if (curItem != null && new File(curItem.path).exists()) {
+                              mediaPlayer.reset();
+                              mediaPlayer.setDataSource(curItem.path);
+                              mediaPlayer.prepare();
+                              mediaPlayer.setLooping(singleLoop);
+                              isPlayerPrepared = true;
+                          } else {
+                              return;
+                          }
+                      }
+
                       int dur = mediaPlayer.getDuration();
                       if (dur <= 0) return;
-                      int clamped = Math.max(0, Math.min(dur, newPos));
+                      final int clamped = Math.max(0, Math.min(dur, newPos));
+
+                      lockedSeekPos = clamped;
+                      seekLockUntil = System.currentTimeMillis() + 1800L;
                       if (!isPlaying) {
                           pausedSeekPos = clamped;
                       }
-                      pendingSeekPos = clamped;
-                      pendingSeekUntil = System.currentTimeMillis() + 900L;
 
-                      seekCompat(mediaPlayer, clamped);
-                      if (isPlaying) {
-                          applyVoiceAndSpeed();
-                      }
                       AudioItem item = getCurrentItem();
                       if (item != null) {
                           getPrefs(appCtx).edit().putInt("pos_" + item.path, clamped).apply();
                       }
+
+                      seekCompat(mediaPlayer, clamped);
+
+                      if (isPlaying) {
+                          // Verify live seek landed accurately on stubborn devices
+                          mainHandler.postDelayed(() -> {
+                              try {
+                                  if (mediaPlayer != null && isPlaying && mediaPlayer.isPlaying() && lockedSeekPos == clamped) {
+                                      int actual = mediaPlayer.getCurrentPosition();
+                                      if (Math.abs(actual - clamped) > 3000) {
+                                          seekCompat(mediaPlayer, clamped);
+                                      }
+                                  }
+                              } catch (Throwable ignored) {}
+                          }, 220L);
+                      }
+
                       refreshForegroundNotification(appCtx);
                       notifyUi();
                   } catch (Throwable ignored) {}
@@ -1274,7 +1340,7 @@ jobs:
 
               public static void seekAndUpdate(Context ctx, int change) {
                   try {
-                      if (mediaPlayer == null || !isPlayerPrepared) return;
+                      if (mediaPlayer == null) return;
                       seekToPosition(ctx, getEffectivePosition() + change);
                   } catch (Throwable ignored) {}
               }
@@ -1288,8 +1354,8 @@ jobs:
                       }
                       isPlayerPrepared = false;
                       pausedSeekPos = -1;
-                      pendingSeekPos = -1;
-                      pendingSeekUntil = 0L;
+                      lockedSeekPos = -1;
+                      seekLockUntil = 0L;
                       stopEchoPlayer();
                       releaseAudioEffects();
                       isPlaying = false;
@@ -1381,33 +1447,33 @@ jobs:
                           ctx, 0, openIntent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
                   PendingIntent piPrev = createActionPendingIntent(ctx, 1, ACTION_PREV);
-                  PendingIntent piRewind = createActionPendingIntent(ctx, 5, ACTION_REWIND);
                   PendingIntent piPlay = createActionPendingIntent(ctx, 2, ACTION_PLAY);
-                  PendingIntent piForward = createActionPendingIntent(ctx, 6, ACTION_FORWARD);
                   PendingIntent piNext = createActionPendingIntent(ctx, 3, ACTION_NEXT);
                   PendingIntent piClose = createActionPendingIntent(ctx, 4, ACTION_CLOSE);
+                  PendingIntent piForward = createActionPendingIntent(ctx, 6, ACTION_FORWARD);
 
                   String titleToDisplay = (item != null)
                           ? getTagsPrefs(ctx).getString(item.path + "_title", item.name)
                           : "MJ Audio Player";
 
+                  // Android MediaStyle shows max 5 buttons: Prev, Play/Pause, Next, Forward, Close
                   builder.setContentTitle(titleToDisplay)
                           .setContentText("MJ Audio Player")
                           .setSmallIcon(R.drawable.ic_stat_music)
                           .setContentIntent(piOpen)
+                          .setDeleteIntent(piClose)
                           .setOngoing(isPlay)
                           .setVisibility(Notification.VISIBILITY_PUBLIC)
                           .addAction(android.R.drawable.ic_media_previous, "Prev", piPrev)
-                          .addAction(android.R.drawable.ic_media_rew, "Rewind", piRewind)
                           .addAction(isPlay ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play,
                                   isPlay ? "Pause" : "Play", piPlay)
-                          .addAction(android.R.drawable.ic_media_ff, "Forward", piForward)
                           .addAction(android.R.drawable.ic_media_next, "Next", piNext)
+                          .addAction(android.R.drawable.ic_media_ff, "Forward", piForward)
                           .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Close", piClose);
 
                   try {
                       Notification.MediaStyle style = new Notification.MediaStyle();
-                      style.setShowActionsInCompactView(1, 2, 3);
+                      style.setShowActionsInCompactView(0, 1, 2);
                       if (Build.VERSION.SDK_INT >= 21 && mediaSession != null) {
                           style.setMediaSession(mediaSession.getSessionToken());
 
@@ -1441,12 +1507,11 @@ jobs:
                                           | PlaybackState.ACTION_SEEK_TO
                                           | PlaybackState.ACTION_STOP
                           );
-                          stateBuilder.addCustomAction(new PlaybackState.CustomAction.Builder(
-                                  CUSTOM_ACTION_REWIND, "Rewind", android.R.drawable.ic_media_rew).build());
-                          stateBuilder.addCustomAction(new PlaybackState.CustomAction.Builder(
-                                  CUSTOM_ACTION_FORWARD, "Forward", android.R.drawable.ic_media_ff).build());
+                          // Close placed in 1st custom slot so Android 13/14/15/16 ALWAYS displays it
                           stateBuilder.addCustomAction(new PlaybackState.CustomAction.Builder(
                                   CUSTOM_ACTION_CLOSE, "Close", android.R.drawable.ic_menu_close_clear_cancel).build());
+                          stateBuilder.addCustomAction(new PlaybackState.CustomAction.Builder(
+                                  CUSTOM_ACTION_FORWARD, "Forward", android.R.drawable.ic_media_ff).build());
                           mediaSession.setPlaybackState(stateBuilder.build());
                       }
                       builder.setStyle(style);
@@ -1596,7 +1661,7 @@ jobs:
                   LinearLayout card;
                   TextView titleText;
                   TextView metaText;
-                  int appliedStyleState = -1; // -1: unset, 0: normal, 1: active
+                  int appliedStyleState = -1;
               }
 
               private Context ctx;
@@ -1616,6 +1681,7 @@ jobs:
               private String currentSearchQuery = "";
               private boolean isGridView = false;
               private boolean isUserSeeking = false;
+              private int draggedSeekPos = -1;
 
               private List<AudioItem> audioList = new ArrayList<>();
               private String currentFolderFilter = "ALL";
@@ -1977,7 +2043,9 @@ jobs:
                           int dur = MediaPlaybackService.mediaPlayer.getDuration();
                           int pos = MediaPlaybackService.getEffectivePosition();
                           if (dur > 0) {
-                              seekBar.setMax(dur);
+                              if (seekBar.getMax() != dur) {
+                                  seekBar.setMax(dur);
+                              }
                               timeTotal.setText(formatDuration(dur));
                               if (!isUserSeeking) {
                                   seekBar.setProgress(pos);
@@ -2072,7 +2140,7 @@ jobs:
 
                   final ProgressDialog pd = new ProgressDialog(ctx, getDialogThemeRes());
                   pd.setTitle("Updating MJ Audio Player");
-                  pd.setMessage("Downloading version " + latestVersionName + "...");
+                  pd.setMessage("Downloading v" + latestVersionName + "...");
                   pd.setProgressStyle(ProgressDialog.STYLE_HORIZONTAL);
                   pd.setIndeterminate(false);
                   pd.setMax(100);
@@ -2307,8 +2375,8 @@ jobs:
 
                                   if (isNewerVersion(latestVersionName, UpdateConfig.VERSION_NAME)) {
                                       final String downloadUrl = foundApkUrl;
-                                      String msg = "Installed Version: " + UpdateConfig.VERSION_NAME
-                                              + "\nLatest Version: " + latestVersionName
+                                      String msg = "Installed Version: v" + UpdateConfig.VERSION_NAME
+                                              + "\nLatest Version: v" + latestVersionName
                                               + "\n\nWhat's New:\n" + notes;
 
                                       if (!isFinishing() && !isUpdateDialogShowing) {
@@ -2325,7 +2393,7 @@ jobs:
                                   } else if (isManual) {
                                       themedDialog()
                                               .setTitle("Up to Date")
-                                              .setMessage("You already have the latest version.\n\nCurrent Version: "
+                                              .setMessage("You already have the latest version.\n\nCurrent Version: v"
                                                       + UpdateConfig.VERSION_NAME)
                                               .setPositiveButton("OK", null)
                                               .show();
@@ -2775,6 +2843,7 @@ jobs:
                       @Override
                       public void onProgressChanged(SeekBar sb, int progress, boolean fromUser) {
                           if (fromUser) {
+                              draggedSeekPos = progress;
                               timeCurrent.setText(formatDuration(progress));
                           }
                       }
@@ -2782,14 +2851,17 @@ jobs:
                       @Override
                       public void onStartTrackingTouch(SeekBar sb) {
                           isUserSeeking = true;
+                          draggedSeekPos = sb.getProgress();
                       }
 
                       @Override
                       public void onStopTrackingTouch(SeekBar sb) {
-                          isUserSeeking = false;
-                          int target = sb.getProgress();
+                          int target = (draggedSeekPos >= 0) ? draggedSeekPos : sb.getProgress();
+                          draggedSeekPos = -1;
+                          sb.setProgress(target);
                           timeCurrent.setText(formatDuration(target));
                           MediaPlaybackService.seekToPosition(ctx, target);
+                          isUserSeeking = false;
                       }
                   });
               }
@@ -3120,6 +3192,7 @@ jobs:
                                       MediaPlaybackService.mediaPlayer.setDataSource(lastPath);
                                       MediaPlaybackService.mediaPlayer.prepare();
                                       MediaPlaybackService.isPlayerPrepared = true;
+                                      MediaPlaybackService.mediaPlayer.setLooping(MediaPlaybackService.singleLoop);
                                       if (lastPos > 0 && lastPos < MediaPlaybackService.mediaPlayer.getDuration()) {
                                           MediaPlaybackService.pausedSeekPos = lastPos;
                                           MediaPlaybackService.seekCompat(MediaPlaybackService.mediaPlayer, lastPos);
@@ -3316,7 +3389,7 @@ jobs:
                           .show();
               }
 
-              // ==================== 4-LAYER SD CARD DETECTION (ANDROID 7 TO 16) ====================
+              // ==================== 4-LAYER SD CARD DETECTION (ANDROID 7 TO 17) ====================
 
               private Map<String, String> getAvailableStorages() {
                   Map<String, String> storages = new LinkedHashMap<>();
@@ -4304,7 +4377,7 @@ jobs:
                   Button btnAbout = createDialogMenuButton("About & Support", colorChip, colorCardPressed, colorBorder, colorTextMain);
                   btnAbout.setOnClickListener(v -> themedDialog()
                           .setTitle("About & Support")
-                          .setMessage("App Name: MJ Audio Player\nVersion: " + UpdateConfig.VERSION_NAME
+                          .setMessage("App Name: MJ Audio Player\nVersion: v" + UpdateConfig.VERSION_NAME
                                   + "\nDeveloper: Jahbaz hijbani\n\nFeatures:\n- Dark & Light Mode Theme\n- Audio Speed & 28 Voice FX\n- Smart Folder System\n- Full Lock Screen & Notification Controls\n- Internal & SD Card Browser\n- Auto Update via GitHub Releases")
                           .setPositiveButton("OK", null)
                           .show());
@@ -4362,7 +4435,7 @@ jobs:
         run: |
           APKSIGNER=$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -name "apksigner" 2>/dev/null | sort -V | tail -n 1)
           if [ -n "$APKSIGNER" ]; then
-            "$APKSIGNER" verify --verbose --print-certs "MJ-Audio-Player-v${APP_VERSION_NAME}-Release.apk"
+            "$APKSIGNER" verify --verbose --print-certs app/build/outputs/apk/release/app-release.apk
           else
             keytool -printcert -jarfile "MJ-Audio-Player-v${APP_VERSION_NAME}-Release.apk"
           fi
@@ -4382,7 +4455,7 @@ jobs:
             ### MJ Audio Player v${{ env.APP_VERSION_NAME }}
             - **Developer:** Jahbaz Hijbani
             - **Package:** `com.mjaudio.player`
-            - **What's New:** Fixed Seek/Slider while Paused, Direct In-App Update Download & Install (UPDATE button only), Clean versionName Display, WhatsApp Channel Direct Open, Universal v1/v2/v3 Signed APK & Low Memory Optimization
+            - **What's New:** Fixed Seek/Slider Sync (Play & Pause), V1+V2+V3+V4 APK Signing, Direct In-App Update (UPDATE + Later only), Clean versionName Display, Visible Active Close Button in Notification, WhatsApp Channel Direct Open
           files: MJ-Audio-Player-v${{ env.APP_VERSION_NAME }}-Release.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

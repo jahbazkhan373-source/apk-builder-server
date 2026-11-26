@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  APP_VERSION_NAME: '1.5'
+  APP_VERSION_NAME: '1.6'
 
 jobs:
   build:
@@ -23,6 +23,12 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
+
+      - name: Accept Android SDK Licenses
+        run: |
+          if [ -n "$ANDROID_HOME" ] && [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          fi
 
       - name: Generate Custom App Icons
         run: |
@@ -195,26 +201,27 @@ jobs:
           cat > gradle.properties <<'EOF'
           android.useAndroidX=true
           org.gradle.jvmargs=-Xmx2g
+          android.suppressUnsupportedCompileSdk=36
           EOF
 
           cat > app/build.gradle <<'EOF'
           plugins {
-            id 'com.android.application' version '8.2.2'
+            id 'com.android.application' version '8.7.3'
           }
 
           def appVerCode = Integer.parseInt(System.getenv("GITHUB_RUN_NUMBER") ?: "1")
-          def appVerName = System.getenv("APP_VERSION_NAME") ?: "1.5"
+          def appVerName = System.getenv("APP_VERSION_NAME") ?: "1.8"
           def ksStorePass = System.getenv("KEYSTORE_PASSWORD") ?: "MJAud1oReleaseKey2026"
           def ksKeyAlias = System.getenv("KEY_ALIAS") ?: "mj_audio_key"
           def ksKeyPass = System.getenv("KEY_PASSWORD") ?: "MJAud1oReleaseKey2026"
 
           android {
             namespace 'com.mjaudio.player'
-            compileSdk 34
+            compileSdk 36
             defaultConfig {
               applicationId 'com.mjaudio.player'
               minSdk 24
-              targetSdk 34
+              targetSdk 36
               versionCode appVerCode
               versionName appVerName
             }
@@ -272,20 +279,12 @@ jobs:
             <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
             <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
             <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
-            <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
-            <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
             <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
             <uses-permission android:name="android.permission.WAKE_LOCK" />
             <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
             <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
             <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
-            <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-            <uses-permission android:name="android.permission.VIBRATE" />
-            <uses-permission android:name="android.permission.BLUETOOTH" />
-            <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
             <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
-
-            <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
 
             <queries>
               <package android:name="com.whatsapp" />
@@ -531,14 +530,17 @@ jobs:
 
               public static List<AudioItem> displayList = new ArrayList<>();
               public static int currentIndex = -1;
+              public static String currentTrackPath = "";
               public static boolean isPlaying = false;
               public static boolean isPlayerPrepared = false;
               public static String lastStatusText = "No Audio Selected";
 
-              // Bulletproof seek state (keeps slider & audio 100% synced in both Play and Pause states)
+              // Bulletproof seek tracking (100% sync in both Play & Pause, Touch Drag & Step/Accessibility)
               public static volatile int pausedSeekPos = -1;
               public static volatile int lockedSeekPos = -1;
               public static volatile long seekLockUntil = 0L;
+              private static volatile int seekEpoch = 0;
+              private static volatile boolean needsApplyFxAfterSeek = false;
               private static float lastAppliedSpeed = 1.0f;
               private static float lastAppliedPitch = 1.0f;
               private static int lastEchoDelay = 0;
@@ -691,10 +693,10 @@ jobs:
                                   long now = System.currentTimeMillis();
                                   if (now >= seekLockUntil && (now - lastPosSaveTime >= 5000L)) {
                                       lastPosSaveTime = now;
-                                      AudioItem item = getCurrentItem();
-                                      if (item != null) {
+                                      String savePath = getActiveTrackPath(MediaPlaybackService.this);
+                                      if (!savePath.isEmpty()) {
                                           getPrefs(MediaPlaybackService.this).edit()
-                                                  .putInt("pos_" + item.path, current).apply();
+                                                  .putInt("pos_" + savePath, current).apply();
                                       }
                                   }
                               }
@@ -721,17 +723,22 @@ jobs:
                   }
               }
 
-              public static void seekCompat(MediaPlayer mp, int pos) {
+              public static String getActiveTrackPath(Context ctx) {
+                  AudioItem item = getCurrentItem();
+                  if (item != null && item.path != null && !item.path.isEmpty()) {
+                      return item.path;
+                  }
+                  if (currentTrackPath != null && !currentTrackPath.isEmpty()) {
+                      return currentTrackPath;
+                  }
+                  return getPrefs(ctx).getString("lastPlayingPath", "");
+              }
+
+              public static void seekUniversal(MediaPlayer mp, int pos) {
                   if (mp == null) return;
                   try {
-                      if (Build.VERSION.SDK_INT >= 26) {
-                          mp.seekTo(pos, MediaPlayer.SEEK_CLOSEST);
-                      } else {
-                          mp.seekTo(pos);
-                      }
-                  } catch (Throwable t) {
-                      try { mp.seekTo(pos); } catch (Throwable ignored) {}
-                  }
+                      mp.seekTo(Math.max(0, pos));
+                  } catch (Throwable ignored) {}
               }
 
               public static int getEffectivePosition() {
@@ -899,11 +906,14 @@ jobs:
                       try {
                           if (isPlaying) {
                               int actual = mp.getCurrentPosition();
-                              if (lockedSeekPos < 0 || Math.abs(actual - lockedSeekPos) <= 3000) {
+                              if (lockedSeekPos < 0 || Math.abs(actual - lockedSeekPos) <= 2500) {
                                   lockedSeekPos = -1;
                                   seekLockUntil = 0L;
                               }
-                              if (lastEchoDelay > 0) {
+                              if (needsApplyFxAfterSeek) {
+                                  needsApplyFxAfterSeek = false;
+                                  applyVoiceAndSpeed();
+                              } else if (lastEchoDelay > 0) {
                                   syncEchoPlayer(lastEchoDelay, lastEchoVol, lastAppliedSpeed, lastAppliedPitch);
                               }
                           }
@@ -915,9 +925,10 @@ jobs:
                       pausedSeekPos = -1;
                       lockedSeekPos = -1;
                       seekLockUntil = 0L;
-                      AudioItem curr = getCurrentItem();
-                      if (curr != null) {
-                          getPrefs(appCtx).edit().putInt("pos_" + curr.path, 0).apply();
+                      needsApplyFxAfterSeek = false;
+                      String savePath = getActiveTrackPath(appCtx);
+                      if (!savePath.isEmpty()) {
+                          getPrefs(appCtx).edit().putInt("pos_" + savePath, 0).apply();
                       }
                       if (singleLoop && currentIndex >= 0 && currentIndex < displayList.size()) {
                           playAudioAtIndex(appCtx, currentIndex);
@@ -965,28 +976,32 @@ jobs:
                       return;
                   }
                   try {
+                      String path = currentTrackPath;
                       AudioItem item = getCurrentItem();
-                      if (mediaPlayer == null || !mediaPlayer.isPlaying() || item == null) {
+                      if ((path == null || path.isEmpty()) && item != null) path = item.path;
+                      if (mediaPlayer == null || !mediaPlayer.isPlaying() || path == null || path.isEmpty()) {
                           stopEchoPlayer();
                           return;
                       }
                       if (echoPlayer == null) {
                           echoPlayer = new MediaPlayer();
-                          echoPlayer.setDataSource(item.path);
+                          echoPlayer.setDataSource(path);
                           echoPlayer.prepare();
                       }
                       echoPlayer.setLooping(singleLoop);
                       echoPlayer.setVolume(vol, vol);
                       int targetPos = Math.max(0, mediaPlayer.getCurrentPosition() - delayMs);
-                      seekCompat(echoPlayer, targetPos);
+                      seekUniversal(echoPlayer, targetPos);
                       if (!echoPlayer.isPlaying()) {
                           echoPlayer.start();
                       }
                       if (Build.VERSION.SDK_INT >= 23) {
                           PlaybackParams ep = echoPlayer.getPlaybackParams();
-                          ep.setSpeed(speed);
-                          ep.setPitch(pitch);
-                          echoPlayer.setPlaybackParams(ep);
+                          if (Math.abs(ep.getSpeed() - speed) > 0.01f || Math.abs(ep.getPitch() - pitch) > 0.01f) {
+                              ep.setSpeed(speed);
+                              ep.setPitch(pitch);
+                              echoPlayer.setPlaybackParams(ep);
+                          }
                       }
                   } catch (Throwable ignored) {}
               }
@@ -1043,7 +1058,6 @@ jobs:
                           lastEchoDelay = echoDelay;
                           lastEchoVol = echoVol;
 
-                          // Only touch PlaybackParams when speed or pitch actually differs (prevents seek resets)
                           try {
                               PlaybackParams curParams = mediaPlayer.getPlaybackParams();
                               float curSpd = curParams.getSpeed();
@@ -1110,25 +1124,30 @@ jobs:
                   if (pausedSeekPos >= 0) {
                       final int target = pausedSeekPos;
                       pausedSeekPos = -1;
+                      final int myEpoch = ++seekEpoch;
                       lockedSeekPos = target;
-                      seekLockUntil = System.currentTimeMillis() + 1800L;
+                      seekLockUntil = System.currentTimeMillis() + 2500L;
+                      needsApplyFxAfterSeek = true;
 
-                      seekCompat(mediaPlayer, target);
+                      seekUniversal(mediaPlayer, target);
                       mediaPlayer.start();
                       isPlaying = true;
-                      applyVoiceAndSpeed();
+                      seekUniversal(mediaPlayer, target);
 
-                      // Hardware decoder safeguard: verify position 150ms after start
                       mainHandler.postDelayed(() -> {
                           try {
-                              if (mediaPlayer != null && isPlaying && mediaPlayer.isPlaying()) {
+                              if (seekEpoch == myEpoch && mediaPlayer != null && isPlaying && mediaPlayer.isPlaying()) {
                                   int cur = mediaPlayer.getCurrentPosition();
-                                  if (Math.abs(cur - target) > 2000) {
-                                      seekCompat(mediaPlayer, target);
+                                  if (Math.abs(cur - target) > 2500) {
+                                      seekUniversal(mediaPlayer, target);
+                                  }
+                                  if (needsApplyFxAfterSeek) {
+                                      needsApplyFxAfterSeek = false;
+                                      applyVoiceAndSpeed();
                                   }
                               }
                           } catch (Throwable ignored) {}
-                      }, 150L);
+                      }, 200L);
                   } else {
                       mediaPlayer.start();
                       isPlaying = true;
@@ -1143,12 +1162,12 @@ jobs:
                   ensureMediaSession(appCtx);
                   SharedPreferences prefs = getPrefs(appCtx);
 
-                  AudioItem prev = getCurrentItem();
-                  if (prev != null && mediaPlayer != null && isPlayerPrepared) {
+                  String prevPath = getActiveTrackPath(appCtx);
+                  if (!prevPath.isEmpty() && mediaPlayer != null && isPlayerPrepared) {
                       try {
                           int curPos = getEffectivePosition();
                           if (isPlaying || curPos > 0) {
-                              prefs.edit().putInt("pos_" + prev.path, curPos).apply();
+                              prefs.edit().putInt("pos_" + prevPath, curPos).apply();
                           }
                       } catch (Throwable ignored) {}
                   }
@@ -1172,6 +1191,7 @@ jobs:
 
                   currentIndex = index;
                   AudioItem item = displayList.get(currentIndex);
+                  currentTrackPath = item.path;
                   getRecentPrefs(appCtx).edit().putBoolean(item.path, true).apply();
 
                   try {
@@ -1181,6 +1201,7 @@ jobs:
                       pausedSeekPos = -1;
                       lockedSeekPos = -1;
                       seekLockUntil = 0L;
+                      needsApplyFxAfterSeek = false;
 
                       mediaPlayer.reset();
                       isPlayerPrepared = false;
@@ -1191,13 +1212,10 @@ jobs:
 
                       int savedPos = prefs.getInt("pos_" + item.path, 0);
                       if (savedPos > 0 && savedPos < (mediaPlayer.getDuration() - 2000)) {
-                          lockedSeekPos = savedPos;
-                          seekLockUntil = System.currentTimeMillis() + 1500L;
-                          seekCompat(mediaPlayer, savedPos);
+                          pausedSeekPos = savedPos;
                       }
 
-                      mediaPlayer.start();
-                      isPlaying = true;
+                      startWithPendingSeek();
                       String titleToDisplay = getTagsPrefs(appCtx).getString(item.path + "_title", item.name);
                       lastStatusText = "Playing: " + titleToDisplay;
                       abRepeatState = 0;
@@ -1207,7 +1225,6 @@ jobs:
                               .putString("lastPlayingName", titleToDisplay)
                               .apply();
 
-                      applyVoiceAndSpeed();
                       if (instance != null) instance.ensureBgTickRunning();
                       refreshForegroundNotification(appCtx);
                       notifyUi();
@@ -1246,37 +1263,44 @@ jobs:
                           pausedSeekPos = pausePos;
                           lockedSeekPos = -1;
                           seekLockUntil = 0L;
+                          needsApplyFxAfterSeek = false;
                           if (instance != null) instance.stopBgTick();
+                          String activePath = getActiveTrackPath(appCtx);
                           AudioItem item = getCurrentItem();
                           if (item != null) {
                               String title = getTagsPrefs(appCtx).getString(item.path + "_title", item.name);
                               lastStatusText = "Paused: " + title;
-                              getPrefs(appCtx).edit().putInt("pos_" + item.path, pausePos).apply();
+                          }
+                          if (!activePath.isEmpty()) {
+                              getPrefs(appCtx).edit().putInt("pos_" + activePath, pausePos).apply();
                           }
                           refreshForegroundNotification(appCtx);
                           notifyUi();
                       } else {
-                          if (currentIndex == -1 && !displayList.isEmpty()) {
+                          if (isPlayerPrepared) {
+                              startWithPendingSeek();
+                              AudioItem item = getCurrentItem();
+                              if (item != null) {
+                                  String title = getTagsPrefs(appCtx).getString(item.path + "_title", item.name);
+                                  lastStatusText = "Playing: " + title;
+                              } else {
+                                  String lastName = getPrefs(appCtx).getString("lastPlayingName", "");
+                                  if (!lastName.isEmpty()) lastStatusText = "Playing: " + lastName;
+                              }
+                              if (instance != null) instance.ensureBgTickRunning();
+                              refreshForegroundNotification(appCtx);
+                              notifyUi();
+                          } else if (currentIndex >= 0 && currentIndex < displayList.size()) {
+                              playAudioAtIndex(appCtx, currentIndex);
+                          } else if (!displayList.isEmpty()) {
                               playAudioAtIndex(appCtx, 0);
-                          } else if (getCurrentItem() == null) {
+                          } else {
                               String lastPath = getPrefs(appCtx).getString("lastPlayingPath", "");
                               if (!lastPath.isEmpty() && new File(lastPath).exists()) {
                                   File lf = new File(lastPath);
                                   displayList.add(new AudioItem(lf.getName(), lastPath, lf.lastModified(), lf.length(), 0));
                                   playAudioAtIndex(appCtx, 0);
                               }
-                          } else if (!isPlayerPrepared) {
-                              playAudioAtIndex(appCtx, currentIndex);
-                          } else {
-                              startWithPendingSeek();
-                              AudioItem item = getCurrentItem();
-                              if (item != null) {
-                                  String title = getTagsPrefs(appCtx).getString(item.path + "_title", item.name);
-                                  lastStatusText = "Playing: " + title;
-                              }
-                              if (instance != null) instance.ensureBgTickRunning();
-                              refreshForegroundNotification(appCtx);
-                              notifyUi();
                           }
                       }
                   } catch (Throwable ignored) {}
@@ -1288,14 +1312,14 @@ jobs:
                       ensureMediaPlayer(appCtx);
                       if (mediaPlayer == null) return;
 
-                      // If user drags slider while track is selected but not yet prepared, prepare it silently
                       if (!isPlayerPrepared) {
-                          AudioItem curItem = getCurrentItem();
-                          if (curItem != null && new File(curItem.path).exists()) {
+                          String path = getActiveTrackPath(appCtx);
+                          if (path != null && !path.isEmpty() && new File(path).exists()) {
                               mediaPlayer.reset();
-                              mediaPlayer.setDataSource(curItem.path);
+                              mediaPlayer.setDataSource(path);
                               mediaPlayer.prepare();
                               mediaPlayer.setLooping(singleLoop);
+                              currentTrackPath = path;
                               isPlayerPrepared = true;
                           } else {
                               return;
@@ -1305,28 +1329,28 @@ jobs:
                       int dur = mediaPlayer.getDuration();
                       if (dur <= 0) return;
                       final int clamped = Math.max(0, Math.min(dur, newPos));
+                      final int myEpoch = ++seekEpoch;
 
                       lockedSeekPos = clamped;
-                      seekLockUntil = System.currentTimeMillis() + 1800L;
+                      seekLockUntil = System.currentTimeMillis() + 2500L;
                       if (!isPlaying) {
                           pausedSeekPos = clamped;
                       }
 
-                      AudioItem item = getCurrentItem();
-                      if (item != null) {
-                          getPrefs(appCtx).edit().putInt("pos_" + item.path, clamped).apply();
+                      String activePath = getActiveTrackPath(appCtx);
+                      if (!activePath.isEmpty()) {
+                          getPrefs(appCtx).edit().putInt("pos_" + activePath, clamped).apply();
                       }
 
-                      seekCompat(mediaPlayer, clamped);
+                      seekUniversal(mediaPlayer, clamped);
 
                       if (isPlaying) {
-                          // Verify live seek landed accurately on stubborn devices
                           mainHandler.postDelayed(() -> {
                               try {
-                                  if (mediaPlayer != null && isPlaying && mediaPlayer.isPlaying() && lockedSeekPos == clamped) {
+                                  if (seekEpoch == myEpoch && mediaPlayer != null && isPlaying && mediaPlayer.isPlaying()) {
                                       int actual = mediaPlayer.getCurrentPosition();
-                                      if (Math.abs(actual - clamped) > 3000) {
-                                          seekCompat(mediaPlayer, clamped);
+                                      if (Math.abs(actual - clamped) > 2500) {
+                                          seekUniversal(mediaPlayer, clamped);
                                       }
                                   }
                               } catch (Throwable ignored) {}
@@ -1356,6 +1380,7 @@ jobs:
                       pausedSeekPos = -1;
                       lockedSeekPos = -1;
                       seekLockUntil = 0L;
+                      needsApplyFxAfterSeek = false;
                       stopEchoPlayer();
                       releaseAudioEffects();
                       isPlaying = false;
@@ -1447,16 +1472,19 @@ jobs:
                           ctx, 0, openIntent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
                   PendingIntent piPrev = createActionPendingIntent(ctx, 1, ACTION_PREV);
+                  PendingIntent piRewind = createActionPendingIntent(ctx, 5, ACTION_REWIND);
                   PendingIntent piPlay = createActionPendingIntent(ctx, 2, ACTION_PLAY);
+                  PendingIntent piForward = createActionPendingIntent(ctx, 6, ACTION_FORWARD);
                   PendingIntent piNext = createActionPendingIntent(ctx, 3, ACTION_NEXT);
                   PendingIntent piClose = createActionPendingIntent(ctx, 4, ACTION_CLOSE);
-                  PendingIntent piForward = createActionPendingIntent(ctx, 6, ACTION_FORWARD);
 
                   String titleToDisplay = (item != null)
                           ? getTagsPrefs(ctx).getString(item.path + "_title", item.name)
-                          : "MJ Audio Player";
+                          : getPrefs(ctx).getString("lastPlayingName", "MJ Audio Player");
+                  if (titleToDisplay == null || titleToDisplay.isEmpty()) titleToDisplay = "MJ Audio Player";
 
-                  // Android MediaStyle shows max 5 buttons: Prev, Play/Pause, Next, Forward, Close
+                  // Exact 5 notification actions: Prev, Rewind, Play/Pause, Forward, Next
+                  // Swiping away when paused triggers piClose via setDeleteIntent
                   builder.setContentTitle(titleToDisplay)
                           .setContentText("MJ Audio Player")
                           .setSmallIcon(R.drawable.ic_stat_music)
@@ -1465,15 +1493,15 @@ jobs:
                           .setOngoing(isPlay)
                           .setVisibility(Notification.VISIBILITY_PUBLIC)
                           .addAction(android.R.drawable.ic_media_previous, "Prev", piPrev)
+                          .addAction(android.R.drawable.ic_media_rew, "Rewind", piRewind)
                           .addAction(isPlay ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play,
                                   isPlay ? "Pause" : "Play", piPlay)
-                          .addAction(android.R.drawable.ic_media_next, "Next", piNext)
                           .addAction(android.R.drawable.ic_media_ff, "Forward", piForward)
-                          .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Close", piClose);
+                          .addAction(android.R.drawable.ic_media_next, "Next", piNext);
 
                   try {
                       Notification.MediaStyle style = new Notification.MediaStyle();
-                      style.setShowActionsInCompactView(0, 1, 2);
+                      style.setShowActionsInCompactView(1, 2, 3);
                       if (Build.VERSION.SDK_INT >= 21 && mediaSession != null) {
                           style.setMediaSession(mediaSession.getSessionToken());
 
@@ -1507,9 +1535,9 @@ jobs:
                                           | PlaybackState.ACTION_SEEK_TO
                                           | PlaybackState.ACTION_STOP
                           );
-                          // Close placed in 1st custom slot so Android 13/14/15/16 ALWAYS displays it
+                          // Android 13-16 displays Prev + Play/Pause + Next + these 2 custom slots (Rewind & Forward)
                           stateBuilder.addCustomAction(new PlaybackState.CustomAction.Builder(
-                                  CUSTOM_ACTION_CLOSE, "Close", android.R.drawable.ic_menu_close_clear_cancel).build());
+                                  CUSTOM_ACTION_REWIND, "Rewind", android.R.drawable.ic_media_rew).build());
                           stateBuilder.addCustomAction(new PlaybackState.CustomAction.Builder(
                                   CUSTOM_ACTION_FORWARD, "Forward", android.R.drawable.ic_media_ff).build());
                           mediaSession.setPlaybackState(stateBuilder.build());
@@ -1707,7 +1735,7 @@ jobs:
               private Button btnFolders;
               private Button btnABRepeat;
               private Button btnPlayPause;
-              private Button btnSpeed;
+              private Button activeSettingsSpeedBtn;
 
               private AlertDialog fileBrowserDialog = null;
               private final Handler updateHandler = new Handler(Looper.getMainLooper());
@@ -1759,6 +1787,7 @@ jobs:
               private void applySystemBars() {
                   try {
                       Window w = getWindow();
+                      w.getDecorView().setBackgroundColor(colorBg);
                       w.setStatusBarColor(colorBg);
                       w.setNavigationBarColor(colorCard);
                       if (Build.VERSION.SDK_INT >= 23) {
@@ -2020,26 +2049,27 @@ jobs:
               private void syncUiWithPlayer() {
                   try {
                       btnPlayPause.setText(MediaPlaybackService.isPlaying ? "Pause" : "Play");
-                      btnSpeed.setText("Speed: " + MediaPlaybackService.currentPlaybackSpeed + "x");
+                      if (activeSettingsSpeedBtn != null) {
+                          activeSettingsSpeedBtn.setText("Speed: " + MediaPlaybackService.currentPlaybackSpeed + "x");
+                      }
                       trackStatusView.setText(MediaPlaybackService.lastStatusText);
 
                       if (MediaPlaybackService.abRepeatState == 1) {
-                          btnABRepeat.setText("A-B (A Set)");
-                          btnABRepeat.setBackground(makeButtonDrawable(colorAmber, colorAmber, colorAmber, 16));
+                          btnABRepeat.setText("A-B (A)");
+                          btnABRepeat.setBackground(makeButtonDrawable(colorAmber, colorAmber, colorAmber, 12));
                           btnABRepeat.setTextColor(Color.BLACK);
                       } else if (MediaPlaybackService.abRepeatState == 2) {
-                          btnABRepeat.setText("A-B (Active)");
-                          btnABRepeat.setBackground(makeButtonDrawable(colorSuccess, colorSuccess, colorSuccess, 16));
+                          btnABRepeat.setText("A-B On");
+                          btnABRepeat.setBackground(makeButtonDrawable(colorSuccess, colorSuccess, colorSuccess, 12));
                           btnABRepeat.setTextColor(Color.WHITE);
                       } else {
                           btnABRepeat.setText("A-B Repeat");
-                          btnABRepeat.setBackground(makeButtonDrawable(colorChip, colorCardPressed, colorBorder, 16));
+                          btnABRepeat.setBackground(makeButtonDrawable(colorChip, colorCardPressed, colorBorder, 12));
                           btnABRepeat.setTextColor(colorTextMain);
                       }
 
                       if (MediaPlaybackService.mediaPlayer != null
-                              && MediaPlaybackService.isPlayerPrepared
-                              && MediaPlaybackService.getCurrentItem() != null) {
+                              && MediaPlaybackService.isPlayerPrepared) {
                           int dur = MediaPlaybackService.mediaPlayer.getDuration();
                           int pos = MediaPlaybackService.getEffectivePosition();
                           if (dur > 0) {
@@ -2063,6 +2093,9 @@ jobs:
                   updateRunnable = new Runnable() {
                       @Override
                       public void run() {
+                          if (isUserSeeking) {
+                              return;
+                          }
                           try {
                               if (MediaPlaybackService.mediaPlayer != null
                                       && MediaPlaybackService.isPlayerPrepared
@@ -2073,10 +2106,8 @@ jobs:
                                       seekBar.setMax(dur);
                                       timeTotal.setText(formatDuration(dur));
                                   }
-                                  if (!isUserSeeking) {
-                                      seekBar.setProgress(current);
-                                      timeCurrent.setText(formatDuration(current));
-                                  }
+                                  seekBar.setProgress(current);
+                                  timeCurrent.setText(formatDuration(current));
                               }
                           } catch (Throwable ignored) {}
                           updateHandler.postDelayed(this, MediaPlaybackService.isPlaying ? 300 : 1000);
@@ -2261,6 +2292,29 @@ jobs:
                   return UpdateConfig.VERSION_NAME;
               }
 
+              private String sanitizeReleaseNotes(String rawNotes) {
+                  if (rawNotes == null || rawNotes.trim().isEmpty()) {
+                      return "Bug fixes and performance improvements.";
+                  }
+                  StringBuilder sb = new StringBuilder();
+                  String[] lines = rawNotes.split("\\r?\\n");
+                  for (String line : lines) {
+                      String trimmed = line.trim();
+                      if (trimmed.isEmpty()) continue;
+                      String lower = trimmed.toLowerCase(Locale.ROOT);
+                      if (lower.contains("package:") || lower.contains("com.mjaudio.player") || trimmed.startsWith("###")) {
+                          continue;
+                      }
+                      String cleanLine = trimmed.replace("**", "").replace("`", "").trim();
+                      if (!cleanLine.isEmpty()) {
+                          if (sb.length() > 0) sb.append("\n");
+                          sb.append(cleanLine);
+                      }
+                  }
+                  String res = sb.toString().trim();
+                  return res.isEmpty() ? "Bug fixes and performance improvements." : res;
+              }
+
               private boolean isNewerVersion(String remoteVersionName, String localVersionName) {
                   if (remoteVersionName == null || remoteVersionName.trim().isEmpty()) return false;
                   String rClean = remoteVersionName.replaceAll("^[vV]", "").trim();
@@ -2352,7 +2406,7 @@ jobs:
                                   JSONObject json = new JSONObject(finalBody);
                                   final String tagName = json.optString("tag_name", "");
                                   final String releaseName = json.optString("name", "");
-                                  final String notes = json.optString("body", "Bug fixes and improvements.");
+                                  final String cleanNotes = sanitizeReleaseNotes(json.optString("body", ""));
 
                                   String foundApkUrl = null;
                                   String foundApkName = "";
@@ -2375,9 +2429,10 @@ jobs:
 
                                   if (isNewerVersion(latestVersionName, UpdateConfig.VERSION_NAME)) {
                                       final String downloadUrl = foundApkUrl;
-                                      String msg = "Installed Version: v" + UpdateConfig.VERSION_NAME
+                                      String msg = "App: MJ Audio Player"
+                                              + "\nInstalled Version: v" + UpdateConfig.VERSION_NAME
                                               + "\nLatest Version: v" + latestVersionName
-                                              + "\n\nWhat's New:\n" + notes;
+                                              + "\n\nWhat's New:\n" + cleanNotes;
 
                                       if (!isFinishing() && !isUpdateDialogShowing) {
                                           isUpdateDialogShowing = true;
@@ -2393,7 +2448,7 @@ jobs:
                                   } else if (isManual) {
                                       themedDialog()
                                               .setTitle("Up to Date")
-                                              .setMessage("You already have the latest version.\n\nCurrent Version: v"
+                                              .setMessage("MJ Audio Player is up to date.\n\nCurrent Version: v"
                                                       + UpdateConfig.VERSION_NAME)
                                               .setPositiveButton("OK", null)
                                               .show();
@@ -2469,9 +2524,24 @@ jobs:
                   LinearLayout mainLayout = new LinearLayout(ctx);
                   mainLayout.setOrientation(LinearLayout.VERTICAL);
                   mainLayout.setBackgroundColor(colorBg);
-                  mainLayout.setFitsSystemWindows(true);
                   mainLayout.setLayoutParams(new LinearLayout.LayoutParams(-1, -1));
                   mainLayout.setPadding(dp(10), dp(10), dp(10), dp(10));
+
+                  // Proper Edge-to-Edge WindowInsets handling for Android 15, 16, 17+
+                  if (Build.VERSION.SDK_INT >= 20) {
+                      mainLayout.setOnApplyWindowInsetsListener((v, insets) -> {
+                          int pad = dp(10);
+                          v.setPadding(
+                                  insets.getSystemWindowInsetLeft() + pad,
+                                  insets.getSystemWindowInsetTop() + pad,
+                                  insets.getSystemWindowInsetRight() + pad,
+                                  insets.getSystemWindowInsetBottom() + pad
+                          );
+                          return insets.consumeSystemWindowInsets();
+                      });
+                  } else {
+                      mainLayout.setFitsSystemWindows(true);
+                  }
 
                   // ---- TOP HEADER & NAVIGATION CARD ----
                   LinearLayout topBarCard = new LinearLayout(ctx);
@@ -2495,11 +2565,25 @@ jobs:
                   devView.setTextSize(12);
                   devView.setTextColor(colorTextSub);
                   devView.setGravity(Gravity.CENTER);
-                  devView.setPadding(0, dp(2), 0, dp(10));
+                  devView.setPadding(0, dp(2), 0, dp(8));
                   topBarCard.addView(devView);
 
+                  // Settings Button placed right below Developer Name and above the Search button row
+                  Button btnSettingsTop = new Button(ctx);
+                  btnSettingsTop.setText("Settings");
+                  stylePillButton(btnSettingsTop, false, colorPrimary);
+                  btnSettingsTop.setPadding(dp(24), dp(7), dp(24), dp(7));
+                  LinearLayout.LayoutParams settingsTopLp = new LinearLayout.LayoutParams(-2, -2);
+                  settingsTopLp.gravity = Gravity.CENTER_HORIZONTAL;
+                  settingsTopLp.bottomMargin = dp(8);
+                  btnSettingsTop.setLayoutParams(settingsTopLp);
+                  topBarCard.addView(btnSettingsTop);
+
+                  // Search, All Files, Sort, Favorites, View Mode Row
                   HorizontalScrollView topButtonScroll = new HorizontalScrollView(ctx);
                   topButtonScroll.setHorizontalScrollBarEnabled(false);
+                  topButtonScroll.setLayoutParams(new LinearLayout.LayoutParams(-1, -2));
+
                   LinearLayout topButtonRow = new LinearLayout(ctx);
                   topButtonRow.setOrientation(LinearLayout.HORIZONTAL);
 
@@ -2644,11 +2728,11 @@ jobs:
 
                   mainLayout.addView(listContainer);
 
-                  // ---- BOTTOM PLAYER DOCK CARD ----
+                  // ---- BOTTOM PLAYER DOCK CARD (EXACT 2-ROW LAYOUT) ----
                   LinearLayout bottomControlsContainer = new LinearLayout(ctx);
                   bottomControlsContainer.setOrientation(LinearLayout.VERTICAL);
                   bottomControlsContainer.setBackground(makeCardDrawable(colorCard, colorBorder, 18, 1));
-                  bottomControlsContainer.setPadding(dp(10), dp(10), dp(10), dp(10));
+                  bottomControlsContainer.setPadding(dp(8), dp(10), dp(8), dp(10));
                   bottomControlsContainer.setLayoutParams(new LinearLayout.LayoutParams(-1, -2));
 
                   trackStatusView = new TextView(ctx);
@@ -2659,21 +2743,44 @@ jobs:
                   trackStatusView.setSingleLine(true);
                   trackStatusView.setEllipsize(TextUtils.TruncateAt.END);
                   trackStatusView.setGravity(Gravity.CENTER);
-                  trackStatusView.setPadding(dp(4), 0, dp(4), dp(6));
+                  trackStatusView.setPadding(dp(4), 0, dp(4), dp(8));
                   bottomControlsContainer.addView(trackStatusView);
 
+                  // Row above transport controls: Go To Time | Current Time | Slider | Total Time | A-B Repeat
                   LinearLayout seekBarLayout = new LinearLayout(ctx);
                   seekBarLayout.setOrientation(LinearLayout.HORIZONTAL);
                   seekBarLayout.setGravity(Gravity.CENTER_VERTICAL);
+                  seekBarLayout.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+                  LinearLayout.LayoutParams seekRowLp = new LinearLayout.LayoutParams(-1, -2);
+                  seekRowLp.bottomMargin = dp(8);
+                  seekBarLayout.setLayoutParams(seekRowLp);
+
+                  Button btnGoTo = new Button(ctx);
+                  btnGoTo.setText("Go To Time");
+                  btnGoTo.setAllCaps(false);
+                  btnGoTo.setMinHeight(0);
+                  btnGoTo.setMinimumHeight(0);
+                  btnGoTo.setMinWidth(0);
+                  btnGoTo.setMinimumWidth(0);
+                  btnGoTo.setTextSize(10);
+                  btnGoTo.setTextColor(colorTextMain);
+                  btnGoTo.setPadding(dp(7), dp(6), dp(7), dp(6));
+                  btnGoTo.setBackground(makeButtonDrawable(colorChip, colorCardPressed, colorBorder, 12));
+                  LinearLayout.LayoutParams goToLp = new LinearLayout.LayoutParams(-2, -2);
+                  goToLp.rightMargin = dp(4);
+                  btnGoTo.setLayoutParams(goToLp);
+                  seekBarLayout.addView(btnGoTo);
 
                   timeCurrent = new TextView(ctx);
                   timeCurrent.setText("00:00");
-                  timeCurrent.setTextSize(11);
+                  timeCurrent.setTextSize(10);
                   timeCurrent.setTextColor(colorTextSub);
+                  timeCurrent.setPadding(dp(2), 0, dp(2), 0);
                   seekBarLayout.addView(timeCurrent);
 
                   seekBar = new SeekBar(ctx);
                   seekBar.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1f));
+                  seekBar.setPadding(dp(8), dp(6), dp(8), dp(6));
                   try {
                       if (seekBar.getProgressDrawable() != null) {
                           seekBar.getProgressDrawable().setColorFilter(colorAccent, PorterDuff.Mode.SRC_IN);
@@ -2686,44 +2793,33 @@ jobs:
 
                   timeTotal = new TextView(ctx);
                   timeTotal.setText("00:00");
-                  timeTotal.setTextSize(11);
+                  timeTotal.setTextSize(10);
                   timeTotal.setTextColor(colorTextSub);
+                  timeTotal.setPadding(dp(2), 0, dp(2), 0);
                   seekBarLayout.addView(timeTotal);
-
-                  bottomControlsContainer.addView(seekBarLayout);
-
-                  LinearLayout extraControlsRow = new LinearLayout(ctx);
-                  extraControlsRow.setOrientation(LinearLayout.HORIZONTAL);
-                  extraControlsRow.setGravity(Gravity.CENTER);
-                  LinearLayout.LayoutParams extraRowLp = new LinearLayout.LayoutParams(-1, -2);
-                  extraRowLp.topMargin = dp(4);
-                  extraRowLp.bottomMargin = dp(6);
-                  extraControlsRow.setLayoutParams(extraRowLp);
-
-                  Button btnGoTo = new Button(ctx);
-                  btnGoTo.setText("Go To Time");
-                  stylePillButton(btnGoTo, false, colorPrimary);
-                  btnGoTo.setTextSize(11);
-                  btnGoTo.setPadding(dp(12), dp(5), dp(12), dp(5));
-                  LinearLayout.LayoutParams btnGoToParams = new LinearLayout.LayoutParams(-2, -2);
-                  btnGoToParams.setMargins(dp(4), 0, dp(4), 0);
-                  btnGoTo.setLayoutParams(btnGoToParams);
-                  extraControlsRow.addView(btnGoTo);
 
                   btnABRepeat = new Button(ctx);
                   btnABRepeat.setText("A-B Repeat");
-                  stylePillButton(btnABRepeat, false, colorSuccess);
-                  btnABRepeat.setTextSize(11);
-                  btnABRepeat.setPadding(dp(12), dp(5), dp(12), dp(5));
-                  LinearLayout.LayoutParams btnABParams = new LinearLayout.LayoutParams(-2, -2);
-                  btnABParams.setMargins(dp(4), 0, dp(4), 0);
-                  btnABRepeat.setLayoutParams(btnABParams);
-                  extraControlsRow.addView(btnABRepeat);
+                  btnABRepeat.setAllCaps(false);
+                  btnABRepeat.setMinHeight(0);
+                  btnABRepeat.setMinimumHeight(0);
+                  btnABRepeat.setMinWidth(0);
+                  btnABRepeat.setMinimumWidth(0);
+                  btnABRepeat.setTextSize(10);
+                  btnABRepeat.setTextColor(colorTextMain);
+                  btnABRepeat.setPadding(dp(7), dp(6), dp(7), dp(6));
+                  btnABRepeat.setBackground(makeButtonDrawable(colorChip, colorCardPressed, colorBorder, 12));
+                  LinearLayout.LayoutParams abLp = new LinearLayout.LayoutParams(-2, -2);
+                  abLp.leftMargin = dp(4);
+                  btnABRepeat.setLayoutParams(abLp);
+                  seekBarLayout.addView(btnABRepeat);
 
-                  bottomControlsContainer.addView(extraControlsRow);
+                  bottomControlsContainer.addView(seekBarLayout);
 
+                  // Bottom-most Row (above mobile home button): ONLY Prev | Rewind | Play/Pause | Forward | Next
                   LinearLayout controlsLayout = new LinearLayout(ctx);
                   controlsLayout.setOrientation(LinearLayout.HORIZONTAL);
+                  controlsLayout.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
                   controlsLayout.setLayoutParams(new LinearLayout.LayoutParams(-1, -2));
                   controlsLayout.setGravity(Gravity.CENTER);
 
@@ -2740,24 +2836,6 @@ jobs:
                   controlsLayout.addView(btnNext);
                   bottomControlsContainer.addView(controlsLayout);
 
-                  LinearLayout bottomLayout = new LinearLayout(ctx);
-                  bottomLayout.setOrientation(LinearLayout.HORIZONTAL);
-                  bottomLayout.setGravity(Gravity.CENTER);
-                  LinearLayout.LayoutParams botRowLp = new LinearLayout.LayoutParams(-1, -2);
-                  botRowLp.topMargin = dp(6);
-                  bottomLayout.setLayoutParams(botRowLp);
-
-                  Button btnSettings = createBottomButton("Settings");
-                  Button btnVoice = createBottomButton("Voice FX");
-                  Button btnCustomEq = createBottomButton("Custom Equalizer");
-                  btnSpeed = createBottomButton("Speed: " + MediaPlaybackService.currentPlaybackSpeed + "x");
-
-                  bottomLayout.addView(btnSettings);
-                  bottomLayout.addView(btnVoice);
-                  bottomLayout.addView(btnCustomEq);
-                  bottomLayout.addView(btnSpeed);
-
-                  bottomControlsContainer.addView(bottomLayout);
                   mainLayout.addView(bottomControlsContainer);
 
                   setContentView(mainLayout);
@@ -2816,12 +2894,9 @@ jobs:
                   btnGoTo.setOnClickListener(v -> showGoToTimeDialog());
                   btnABRepeat.setOnClickListener(v -> handleABRepeat());
                   btnSort.setOnClickListener(v -> showSortDialog());
-                  btnCustomEq.setOnClickListener(v -> showCustomEqDialog());
                   btnAllFiles.setOnClickListener(v -> showStorageSelectorDialog());
                   btnFolders.setOnClickListener(v -> showFoldersDialog());
-                  btnVoice.setOnClickListener(v -> showVoiceEffectsDialog());
-                  btnSpeed.setOnClickListener(v -> showSpeedDialog());
-                  btnSettings.setOnClickListener(v -> showSettingsDialog());
+                  btnSettingsTop.setOnClickListener(v -> showSettingsDialog());
 
                   btnPlayPause.setOnClickListener(v -> MediaPlaybackService.togglePlayPause(ctx));
                   btnPrev.setOnClickListener(v -> MediaPlaybackService.playPreviousTrack(ctx));
@@ -2839,18 +2914,23 @@ jobs:
                   listView.setOnItemLongClickListener(itemLongClickListener);
                   gridView.setOnItemLongClickListener(itemLongClickListener);
 
+                  // Handles BOTH touch drag AND step/Accessibility/TalkBack SeekBar changes
                   seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
                       @Override
                       public void onProgressChanged(SeekBar sb, int progress, boolean fromUser) {
                           if (fromUser) {
                               draggedSeekPos = progress;
                               timeCurrent.setText(formatDuration(progress));
+                              if (!isUserSeeking) {
+                                  MediaPlaybackService.seekToPosition(ctx, progress);
+                              }
                           }
                       }
 
                       @Override
                       public void onStartTrackingTouch(SeekBar sb) {
                           isUserSeeking = true;
+                          stopUiProgressUpdater();
                           draggedSeekPos = sb.getProgress();
                       }
 
@@ -2862,6 +2942,7 @@ jobs:
                           timeCurrent.setText(formatDuration(target));
                           MediaPlaybackService.seekToPosition(ctx, target);
                           isUserSeeking = false;
+                          startUiProgressUpdater();
                       }
                   });
               }
@@ -2885,24 +2966,6 @@ jobs:
                   }
                   LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -2, isPrimary ? 1.25f : 1.0f);
                   params.setMargins(dp(3), dp(2), dp(3), dp(2));
-                  btn.setLayoutParams(params);
-                  return btn;
-              }
-
-              private Button createBottomButton(String text) {
-                  Button btn = new Button(ctx);
-                  btn.setText(text);
-                  btn.setAllCaps(false);
-                  btn.setMinHeight(0);
-                  btn.setMinimumHeight(0);
-                  btn.setMinWidth(0);
-                  btn.setMinimumWidth(0);
-                  btn.setTextSize(10);
-                  btn.setTextColor(colorTextMain);
-                  btn.setPadding(dp(3), dp(8), dp(3), dp(8));
-                  btn.setBackground(makeButtonDrawable(colorBg, colorCardPressed, colorBorder, 10));
-                  LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -2, 1.0f);
-                  params.setMargins(dp(3), 0, dp(3), 0);
                   btn.setLayoutParams(params);
                   return btn;
               }
@@ -2983,7 +3046,7 @@ jobs:
 
               private void sortDisplayList() {
                   AudioItem playingItem = MediaPlaybackService.getCurrentItem();
-                  String playingPath = (playingItem != null) ? playingItem.path : null;
+                  String playingPath = (playingItem != null) ? playingItem.path : MediaPlaybackService.currentTrackPath;
 
                   Comparator<AudioItem> comparator;
                   if ("Title (Ascending)".equals(currentSortOrder) || "Name (A to Z)".equals(currentSortOrder)) {
@@ -3006,7 +3069,7 @@ jobs:
 
                   Collections.sort(MediaPlaybackService.displayList, comparator);
 
-                  if (playingPath != null) {
+                  if (playingPath != null && !playingPath.isEmpty()) {
                       for (int i = 0; i < MediaPlaybackService.displayList.size(); i++) {
                           if (playingPath.equals(MediaPlaybackService.displayList.get(i).path)) {
                               MediaPlaybackService.currentIndex = i;
@@ -3095,8 +3158,10 @@ jobs:
                           }
 
                           AudioItem item = list.get(position);
+                          String activePath = MediaPlaybackService.currentTrackPath;
                           AudioItem currentItem = MediaPlaybackService.getCurrentItem();
-                          boolean isCurrent = (currentItem != null && item.path.equals(currentItem.path));
+                          if (currentItem != null) activePath = currentItem.path;
+                          boolean isCurrent = (activePath != null && item.path.equals(activePath));
                           boolean isFav = favPrefs.getBoolean(item.path, false);
 
                           String titleToDisplay = tagsPrefs.getString(item.path + "_title", item.name);
@@ -3191,11 +3256,12 @@ jobs:
                                       MediaPlaybackService.mediaPlayer.reset();
                                       MediaPlaybackService.mediaPlayer.setDataSource(lastPath);
                                       MediaPlaybackService.mediaPlayer.prepare();
+                                      MediaPlaybackService.currentTrackPath = lastPath;
                                       MediaPlaybackService.isPlayerPrepared = true;
                                       MediaPlaybackService.mediaPlayer.setLooping(MediaPlaybackService.singleLoop);
                                       if (lastPos > 0 && lastPos < MediaPlaybackService.mediaPlayer.getDuration()) {
                                           MediaPlaybackService.pausedSeekPos = lastPos;
-                                          MediaPlaybackService.seekCompat(MediaPlaybackService.mediaPlayer, lastPos);
+                                          MediaPlaybackService.seekUniversal(MediaPlaybackService.mediaPlayer, lastPos);
                                       } else {
                                           MediaPlaybackService.pausedSeekPos = 0;
                                       }
@@ -3396,7 +3462,6 @@ jobs:
                   String internalPath = Environment.getExternalStorageDirectory().getAbsolutePath();
                   storages.put(internalPath, "Internal storage");
 
-                  // Layer 1: Official StorageManager API (Android 7+)
                   try {
                       StorageManager sm = (StorageManager) ctx.getSystemService(Context.STORAGE_SERVICE);
                       if (sm != null && Build.VERSION.SDK_INT >= 24) {
@@ -3440,7 +3505,6 @@ jobs:
                       }
                   } catch (Throwable ignored) {}
 
-                  // Layer 2: Context.getExternalFilesDirs(null)
                   try {
                       File[] files = ctx.getExternalFilesDirs(null);
                       if (files != null) {
@@ -3462,7 +3526,6 @@ jobs:
                       }
                   } catch (Throwable ignored) {}
 
-                  // Layer 3: Direct /storage directory scan
                   try {
                       File storageDir = new File("/storage");
                       if (storageDir.exists()) {
@@ -3482,7 +3545,6 @@ jobs:
                       }
                   } catch (Throwable ignored) {}
 
-                  // Layer 4: /proc/mounts fallback
                   try (BufferedReader br = new BufferedReader(new FileReader("/proc/mounts"))) {
                       Pattern mp = Pattern.compile(" (/storage/[A-Za-z0-9_.-]+) ");
                       String line;
@@ -3597,10 +3659,10 @@ jobs:
                           showFileBrowser(selected.path);
                       } else {
                           if (isAudioFileName(selected.name)) {
-                              AudioItem prevItem = MediaPlaybackService.getCurrentItem();
-                              if (prevItem != null && MediaPlaybackService.mediaPlayer != null && MediaPlaybackService.isPlayerPrepared) {
+                              String prevPath = MediaPlaybackService.getActiveTrackPath(ctx);
+                              if (!prevPath.isEmpty() && MediaPlaybackService.mediaPlayer != null && MediaPlaybackService.isPlayerPrepared) {
                                   try {
-                                      prefs.edit().putInt("pos_" + prevItem.path,
+                                      prefs.edit().putInt("pos_" + prevPath,
                                               MediaPlaybackService.getEffectivePosition()).apply();
                                   } catch (Throwable ignored) {}
                               }
@@ -3733,10 +3795,10 @@ jobs:
                   final AlertDialog folderDialog = builder.create();
 
                   flistView.setOnItemClickListener((parent, view, position, id) -> {
-                      AudioItem curr = MediaPlaybackService.getCurrentItem();
-                      if (curr != null && MediaPlaybackService.mediaPlayer != null && MediaPlaybackService.isPlayerPrepared) {
+                      String activePath = MediaPlaybackService.getActiveTrackPath(ctx);
+                      if (!activePath.isEmpty() && MediaPlaybackService.mediaPlayer != null && MediaPlaybackService.isPlayerPrepared) {
                           try {
-                              prefs.edit().putInt("pos_" + curr.path,
+                              prefs.edit().putInt("pos_" + activePath,
                                       MediaPlaybackService.getEffectivePosition()).apply();
                           } catch (Throwable ignored) {}
                       }
@@ -3850,7 +3912,9 @@ jobs:
                           .setItems(speedNames, (dialog, which) -> {
                               MediaPlaybackService.currentPlaybackSpeed = speedOptions[which];
                               prefs.edit().putFloat("playbackSpeed", MediaPlaybackService.currentPlaybackSpeed).apply();
-                              btnSpeed.setText("Speed: " + MediaPlaybackService.currentPlaybackSpeed + "x");
+                              if (activeSettingsSpeedBtn != null) {
+                                  activeSettingsSpeedBtn.setText("Speed: " + MediaPlaybackService.currentPlaybackSpeed + "x");
+                              }
                               if (MediaPlaybackService.mediaPlayer != null && MediaPlaybackService.isPlaying) {
                                   MediaPlaybackService.applyVoiceAndSpeed();
                                   MediaPlaybackService.refreshForegroundNotification(ctx);
@@ -3901,7 +3965,7 @@ jobs:
                                       }
                                   }
                               } else {
-                                  if (which == 0) { // Info
+                                  if (which == 0) {
                                       String ext = getExtension(item.path);
                                       long durMs = item.duration;
                                       MediaMetadataRetriever mmr = new MediaMetadataRetriever();
@@ -3923,7 +3987,7 @@ jobs:
                                               .setMessage(infoMsg)
                                               .setPositiveButton("OK", null)
                                               .show();
-                                  } else if (which == 1) { // Favorite
+                                  } else if (which == 1) {
                                       if (isFav) {
                                           favPrefs.edit().remove(item.path).apply();
                                           Toast.makeText(ctx, "Removed from Favorites", Toast.LENGTH_SHORT).show();
@@ -3932,7 +3996,7 @@ jobs:
                                           Toast.makeText(ctx, "Added to Favorites", Toast.LENGTH_SHORT).show();
                                       }
                                       refreshListView();
-                                  } else if (which == 2) { // Share
+                                  } else if (which == 2) {
                                       try {
                                           StrictMode.VmPolicy.Builder builder = new StrictMode.VmPolicy.Builder();
                                           StrictMode.setVmPolicy(builder.build());
@@ -3942,7 +4006,7 @@ jobs:
                                           shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
                                           ctx.startActivity(Intent.createChooser(shareIntent, "Share Audio via:"));
                                       } catch (Throwable ignored) {}
-                                  } else if (which == 3) { // Rename
+                                  } else if (which == 3) {
                                       LinearLayout wrap = new LinearLayout(ctx);
                                       wrap.setPadding(dp(20), dp(12), dp(20), dp(4));
                                       EditText renameInput = new EditText(ctx);
@@ -3975,7 +4039,7 @@ jobs:
                                               })
                                               .setNegativeButton("Cancel", null)
                                               .show();
-                                  } else if (which == 4) { // Edit Tags
+                                  } else if (which == 4) {
                                       LinearLayout wrap = new LinearLayout(ctx);
                                       wrap.setPadding(dp(20), dp(12), dp(20), dp(4));
                                       EditText tagInput = new EditText(ctx);
@@ -3997,7 +4061,7 @@ jobs:
                                               })
                                               .setNegativeButton("Cancel", null)
                                               .show();
-                                  } else if (which == 5) { // Add to Playlist
+                                  } else if (which == 5) {
                                       String allPlaylistsStr = playlistsPrefs.getString("all_playlists", "");
                                       final List<String> pList = new ArrayList<>();
                                       for (String pName : allPlaylistsStr.split("\\|")) {
@@ -4020,7 +4084,7 @@ jobs:
                                                   })
                                                   .show();
                                       }
-                                  } else if (which == 6) { // Move to Trash
+                                  } else if (which == 6) {
                                       trashPrefs.edit().putBoolean(item.path, true).apply();
                                       Toast.makeText(ctx, "Moved to Trash Bin", Toast.LENGTH_SHORT).show();
                                       refreshListView();
@@ -4231,14 +4295,30 @@ jobs:
 
                   final AlertDialog[] dlgRef = new AlertDialog[1];
 
-                  // ---- DARK / LIGHT MODE TOGGLE ROW ----
+                  // ---- TOP 3 BUTTONS INSIDE SETTINGS: Voice FX, Custom Equalizer, Speed ----
+                  Button btnVoice = createDialogMenuButton("Voice FX", colorChip, colorCardPressed, colorBorder, colorTextMain);
+                  btnVoice.setOnClickListener(v -> showVoiceEffectsDialog());
+                  innerLayout.addView(btnVoice);
+
+                  Button btnCustomEq = createDialogMenuButton("Custom Equalizer", colorChip, colorCardPressed, colorBorder, colorTextMain);
+                  btnCustomEq.setOnClickListener(v -> showCustomEqDialog());
+                  innerLayout.addView(btnCustomEq);
+
+                  final Button btnSpeedSetting = createDialogMenuButton(
+                          "Speed: " + MediaPlaybackService.currentPlaybackSpeed + "x",
+                          colorChip, colorCardPressed, colorBorder, colorTextMain);
+                  activeSettingsSpeedBtn = btnSpeedSetting;
+                  btnSpeedSetting.setOnClickListener(v -> showSpeedDialog());
+                  innerLayout.addView(btnSpeedSetting);
+
+                  // ---- EXISTING SETTINGS (ALL PRESERVED) ----
                   LinearLayout themeRow = new LinearLayout(ctx);
                   themeRow.setOrientation(LinearLayout.HORIZONTAL);
                   themeRow.setGravity(Gravity.CENTER_VERTICAL);
                   themeRow.setBackground(makeCardDrawable(colorChip, colorBorder, 12, 1));
                   themeRow.setPadding(dp(14), dp(10), dp(14), dp(10));
                   LinearLayout.LayoutParams themeRowLp = new LinearLayout.LayoutParams(-1, -2);
-                  themeRowLp.setMargins(0, dp(4), 0, dp(8));
+                  themeRowLp.setMargins(0, dp(6), 0, dp(6));
                   themeRow.setLayoutParams(themeRowLp);
 
                   TextView themeLabel = new TextView(ctx);
@@ -4386,6 +4466,11 @@ jobs:
                   settingsBuilder.setView(layout);
                   settingsBuilder.setNegativeButton("Close", null);
                   dlgRef[0] = settingsBuilder.create();
+                  dlgRef[0].setOnDismissListener(d -> {
+                      if (activeSettingsSpeedBtn == btnSpeedSetting) {
+                          activeSettingsSpeedBtn = null;
+                      }
+                  });
                   dlgRef[0].show();
               }
           }
@@ -4420,31 +4505,58 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.5'
+          gradle-version: '8.9'
 
-      - name: Build Signed Release APK
+      - name: Build & Sign Release APK (V1 + V2 + V3 + V4)
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           gradle assembleRelease --stacktrace
-          cp app/build/outputs/apk/release/app-release.apk "MJ-Audio-Player-v${APP_VERSION_NAME}-Release.apk"
-
-      - name: Verify Release APK Signature
-        run: |
+          OUT_APK="MJ-Audio-Player-v${APP_VERSION_NAME}-Release.apk"
+          STORE_PASS="${KEYSTORE_PASSWORD:-MJAud1oReleaseKey2026}"
+          ALIAS_NAME="${KEY_ALIAS:-mj_audio_key}"
+          KEY_PASS="${KEY_PASSWORD:-MJAud1oReleaseKey2026}"
           APKSIGNER=$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -name "apksigner" 2>/dev/null | sort -V | tail -n 1)
           if [ -n "$APKSIGNER" ]; then
-            "$APKSIGNER" verify --verbose --print-certs app/build/outputs/apk/release/app-release.apk
+            "$APKSIGNER" sign \
+              --ks app/release.keystore \
+              --ks-key-alias "$ALIAS_NAME" \
+              --ks-pass "pass:$STORE_PASS" \
+              --key-pass "pass:$KEY_PASS" \
+              --v1-signing-enabled true \
+              --v2-signing-enabled true \
+              --v3-signing-enabled true \
+              --v4-signing-enabled true \
+              --out "$OUT_APK" \
+              app/build/outputs/apk/release/app-release.apk
           else
-            keytool -printcert -jarfile "MJ-Audio-Player-v${APP_VERSION_NAME}-Release.apk"
+            cp app/build/outputs/apk/release/app-release.apk "$OUT_APK"
+            if [ -f app/build/outputs/apk/release/app-release.apk.idsig ]; then
+              cp app/build/outputs/apk/release/app-release.apk.idsig "${OUT_APK}.idsig"
+            fi
+          fi
+
+      - name: Verify Release APK Signature (V1 + V2 + V3 + V4)
+        run: |
+          OUT_APK="MJ-Audio-Player-v${APP_VERSION_NAME}-Release.apk"
+          APKSIGNER=$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -name "apksigner" 2>/dev/null | sort -V | tail -n 1)
+          if [ -n "$APKSIGNER" ] && [ -f "${OUT_APK}.idsig" ]; then
+            "$APKSIGNER" verify --verbose --v4-signature-file "${OUT_APK}.idsig" --print-certs "$OUT_APK"
+          elif [ -n "$APKSIGNER" ]; then
+            "$APKSIGNER" verify --verbose --print-certs "$OUT_APK"
+          else
+            keytool -printcert -jarfile "$OUT_APK"
           fi
 
       - name: Upload Signed Release APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: mj-audio-player-signed-release
-          path: MJ-Audio-Player-v${{ env.APP_VERSION_NAME }}-Release.apk
+          path: |
+            MJ-Audio-Player-v${{ env.APP_VERSION_NAME }}-Release.apk
+            MJ-Audio-Player-v${{ env.APP_VERSION_NAME }}-Release.apk.idsig
 
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
@@ -4452,10 +4564,13 @@ jobs:
           tag_name: v${{ env.APP_VERSION_NAME }}
           name: MJ Audio Player v${{ env.APP_VERSION_NAME }}
           body: |
-            ### MJ Audio Player v${{ env.APP_VERSION_NAME }}
-            - **Developer:** Jahbaz Hijbani
-            - **Package:** `com.mjaudio.player`
-            - **What's New:** Fixed Seek/Slider Sync (Play & Pause), V1+V2+V3+V4 APK Signing, Direct In-App Update (UPDATE + Later only), Clean versionName Display, Visible Active Close Button in Notification, WhatsApp Channel Direct Open
-          files: MJ-Audio-Player-v${{ env.APP_VERSION_NAME }}-Release.apk
+            - Removed 6 unnecessary permissions for cleaner privacy & security
+            - Moved Settings button below Developer Name and above Search bar
+            - Restored Rewind button in Notification (Prev, Rewind, Play/Pause, Forward, Next)
+            - Target SDK Android 16 (API 36), Min SDK Android 7 (API 24)
+            - Full Seek/Slider Sync & V1 + V2 + V3 + V4 Release Signing
+          files: |
+            MJ-Audio-Player-v${{ env.APP_VERSION_NAME }}-Release.apk
+            MJ-Audio-Player-v${{ env.APP_VERSION_NAME }}-Release.apk.idsig
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
